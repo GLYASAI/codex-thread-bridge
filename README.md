@@ -97,8 +97,7 @@ Each intentional new message requires a new `request_id`.
 - Project IDs belong to App Server's registry. Desktop controls its own project
   association and task listing. Worktrees created by the bridge have a manual
   lifecycle rather than a Desktop-managed lifecycle.
-- New and resumed turns carry bridge instructions as `toolOutput` with the bridge
-  tool's name. The bridge leaves client-side tool calls and approval requests
+- New and resumed turns carry the prompt as user text `input`. The bridge leaves client-side tool calls and approval requests
   unanswered so it cannot consume another client's shared callback. A capable
   client such as Desktop must be subscribed to the thread to handle them; the
   bridge does not establish that subscription or provide interactive approvals.

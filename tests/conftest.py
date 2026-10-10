@@ -121,9 +121,7 @@ class FakeServer:
                         {
                             "type": "agentMessage",
                             "text": (
-                                params["toolOutput"]["output"]
-                                if "toolOutput" in params
-                                else params["input"][0]["text"]
+                                params["input"][0]["text"]
                             ),
                         }
                     ],

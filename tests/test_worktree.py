@@ -313,12 +313,8 @@ async def test_mcp_isolated_launch_and_followup_are_durable(fake_server, reposit
     thread = fake.threads[receipts[0]["threadId"]]
     assert [t["items"][0]["text"] for t in thread["turns"]] == [args["prompt"], "FOLLOWUP"]
     initial = next(params for method, params in fake.calls if method == "turn/start")
-    assert initial["input"] == []
-    assert initial["toolOutput"] == {
-        "name": "create_worktree_thread",
-        "namespace": "codex_thread_bridge",
-        "output": args["prompt"],
-    }
+    assert initial["input"] == [{"type": "text", "text": args["prompt"]}]
+    assert "toolOutput" not in initial
     assert receipts[0]["creation"]["reasoningEffort"] == "high"
 
 

@@ -368,12 +368,7 @@ class Bridge:
                     "turn/start",
                     {
                         "threadId": thread_id,
-                        "input": [],
-                        "toolOutput": {
-                            "name": "create_thread",
-                            "namespace": "codex_thread_bridge",
-                            "output": prompt,
-                        },
+                        "input": [{"type": "text", "text": prompt}],
                     },
                 )
                 receipt["turnId"] = turn["turn"]["id"]
@@ -554,12 +549,7 @@ class Bridge:
                     "turn/start",
                     {
                         "threadId": receipt["threadId"],
-                        "input": [],
-                        "toolOutput": {
-                            "name": "create_worktree_thread",
-                            "namespace": "codex_thread_bridge",
-                            "output": prompt,
-                        },
+                        "input": [{"type": "text", "text": prompt}],
                     },
                 )
                 checkpoint(
@@ -737,12 +727,7 @@ class Bridge:
                 "turn/start",
                 {
                     "threadId": thread_id,
-                    "input": [],
-                    "toolOutput": {
-                        "name": "send_message_to_thread",
-                        "namespace": "codex_thread_bridge",
-                        "output": message,
-                    },
+                    "input": [{"type": "text", "text": message}],
                 },
             )
             receipt["turnId"] = turn["turn"]["id"]
