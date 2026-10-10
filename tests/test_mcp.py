@@ -78,6 +78,8 @@ async def test_real_mcp_stdio_discovery_create_read_and_dedup(fake_server, tmp_p
             "get_goal",
             "get_operation",
             "update_thread_permissions",
+            "interrupt_turn",
+            "get_turn_result",
         }
         caps = await session.call_tool("get_capabilities", {})
         assert not caps.isError

@@ -121,8 +121,19 @@ class Ledger:
                     )
 
 
-def open_endpoint_ledger(socket_path: Path, state_dir: Path):
-    """Use one ledger for a canonical endpoint, importing the supplied legacy alias if present."""
+def open_endpoint_ledger(socket_path: Path, state_dir: Path, endpoint_id: str | None = None):
+    """Use one ledger for a canonical endpoint, importing the supplied legacy alias if present.
+
+    With endpoint_id (remote mode) the ledger is keyed by that stable name instead of the socket
+    path, because a forwarded local socket path can differ on every launch.
+    """
+    if endpoint_id is not None:
+        state_dir = state_dir.expanduser().resolve()
+        digest = hashlib.sha256(("endpoint-id:" + endpoint_id).encode()).hexdigest()[:16]
+        return (
+            socket_path.expanduser().absolute(),
+            Ledger(state_dir / f"operations-{digest}.sqlite3"),
+        )
     supplied = socket_path.expanduser().absolute()
     canonical = supplied.resolve()
     state_dir = state_dir.expanduser().resolve()

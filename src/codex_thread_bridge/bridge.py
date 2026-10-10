@@ -1,7 +1,8 @@
 """Tool behavior, independent of MCP transport and the installed client."""
 
 import asyncio
-from pathlib import Path
+import posixpath
+from pathlib import Path, PurePosixPath
 
 from .ledger import Ledger
 from .rpc import AppServer, RpcError
@@ -18,6 +19,29 @@ def absolute_directory(cwd: str):
     if not path.is_absolute() or not path.is_dir():
         raise ValueError("cwd must be an existing absolute directory on the App Server host")
     return str(path.resolve())
+
+
+# --- charm-codex remote mode (references/upstream-sync.md, patch 1) -----------------------------
+REMOTE_SANDBOXES = frozenset({"read-only", "workspace-write"})
+REMOTE_SANDBOX_TYPES = frozenset({"readOnly", "workspaceWrite"})
+TERMINAL_STATUSES = frozenset({"completed", "failed", "interrupted"})
+
+
+def remote_directory(path, root: str, name: str = "cwd"):
+    """Validate a path on the *remote* App Server host without touching the local filesystem.
+
+    Pure POSIX string handling: absolute, no '..' / '.' / empty segments or control characters,
+    and equal to or under `root`. Returns the (already clean) path unchanged.
+    """
+    if not isinstance(path, str) or not path or any(ord(c) < 0x20 or ord(c) == 0x7F for c in path):
+        raise ValueError(f"{name} must be a non-empty path without control characters")
+    if not path.startswith("/"):
+        raise ValueError(f"{name} must be an absolute POSIX path on the remote host")
+    if any(part in {"", ".", ".."} for part in path.split("/")[1:]):
+        raise ValueError(f"{name} must not contain '..', '.', empty segments or a trailing slash")
+    if path != root and not PurePosixPath(path).is_relative_to(PurePosixPath(root)):
+        raise ValueError(f"{name} must be under the configured repository root {root}")
+    return path
 
 
 DISPLAY_FIELDS = frozenset({"text", "preview", "summary", "objective", "aggregatedOutput"})
@@ -92,16 +116,76 @@ def clipped(value, limit: int, *, display_text: bool = False):
 
 
 class Bridge:
-    def __init__(self, rpc: AppServer, ledger: Ledger):
+    def __init__(self, rpc: AppServer, ledger: Ledger, remote_root: str | None = None):
         self.rpc = rpc
         self.ledger = ledger
         self._mutation_lock = asyncio.Lock()
+        # Remote mode: the App Server runs on another host (reached through an ssh socket
+        # forward). Local filesystem checks are skipped; paths must lie under remote_root.
+        if remote_root is not None and (
+            not remote_root.startswith("/")
+            or remote_root == "/"
+            or posixpath.normpath(remote_root) != remote_root
+        ):
+            raise ValueError("remote_root must be a clean absolute POSIX path other than /")
+        self.remote_root = remote_root
+
+    @property
+    def remote(self) -> bool:
+        return self.remote_root is not None
+
+    def _directory(self, cwd, name="cwd"):
+        if self.remote:
+            return remote_directory(cwd, self.remote_root, name)
+        return absolute_directory(cwd)
+
+    def _check_roots(self, policy):
+        if self.remote:
+            for value in policy.get("writableRoots", []):
+                remote_directory(value, self.remote_root, "writableRoots entry")
+        else:
+            validate_workspace_roots(policy)
+
+    def _check_remote_policy(self, sandbox=None, sandbox_policy=None, approval_policy="never"):
+        if not self.remote:
+            return
+        if sandbox is not None and sandbox not in REMOTE_SANDBOXES:
+            raise ValueError("Remote mode allows only sandbox read-only or workspace-write")
+        if sandbox_policy is not None and sandbox_policy.get("type") not in REMOTE_SANDBOX_TYPES:
+            raise ValueError("Remote mode allows only readOnly or workspaceWrite sandbox policies")
+        if approval_policy != "never":
+            raise ValueError("Remote mode requires approval_policy never")
+
+    async def _remote_thread(self, thread_id):
+        """Remote mode: only drive threads whose cwd lies under the repository root."""
+        if not self.remote:
+            return
+        state = (await self.rpc.call("thread/read", {"threadId": thread_id}))["thread"]
+        try:
+            remote_directory(state.get("cwd"), self.remote_root, "thread cwd")
+        except ValueError as error:
+            raise ValueError(f"Refusing to drive this thread: {error}") from None
+
+    def _check_remote_sandbox(self, settings):
+        if self.remote and (settings.get("sandbox") or {}).get("type") not in REMOTE_SANDBOX_TYPES:
+            raise RpcError(
+                "thread/resume",
+                {
+                    "code": "remote_sandbox_not_allowed",
+                    "message": "Remote mode drives only readOnly/workspaceWrite threads; "
+                    "message withheld",
+                },
+            )
 
     async def capabilities(self):
         await self.rpc.connect()
         return {
             "server": self.rpc.info,
-            "transport": "same-host Unix WebSocket",
+            "transport": (
+                "ssh-forwarded Unix WebSocket (remote mode)"
+                if self.remote
+                else "same-host Unix WebSocket"
+            ),
             "socket": str(self.rpc.socket_path),
             "capabilities": {
                 "createThread": True,
@@ -111,10 +195,13 @@ class Bridge:
                 "goalRead": True,
                 "goalSet": False,
                 "desktopManagedWorktrees": False,
-                "bridgeManagedWorktrees": True,
+                "bridgeManagedWorktrees": not self.remote,
                 "desktopProjectRegistry": False,
-                "clientSideToolsAndApprovals": False,
+                "clientSideToolsAndApprovals": ("declined and recorded" if self.remote else False),
+                "interruptTurn": True,
+                "turnResult": True,
             },
+            "remoteRoot": self.remote_root,
             "desktopVisibility": "Observed on Codex 0.153.4 with an existing project checkout; "
             "verify actual Desktop listing for each launch. Backend project IDs are separate.",
         }
@@ -162,6 +249,7 @@ class Bridge:
         reasoning_effort: str | None = None,
     ):
         validate_execution_policy(approval_policy, approvals_reviewer)
+        self._check_remote_policy(sandbox, sandbox_policy, approval_policy)
         if reasoning_effort is not None:
             nonempty(reasoning_effort, "reasoning_effort", 128)
         if sandbox_policy is not None:
@@ -169,6 +257,8 @@ class Bridge:
             if sandbox_policy["type"] != SANDBOX_POLICY_TYPES.get(sandbox):
                 raise ValueError("sandbox and sandbox_policy.type must agree")
         nonempty(cwd, "cwd")
+        if self.remote:
+            cwd = self._directory(cwd)
         if not Path(cwd).is_absolute():
             raise ValueError("cwd must be an existing absolute directory on the App Server host")
         if sandbox not in SANDBOX_POLICY_TYPES:
@@ -223,9 +313,9 @@ class Bridge:
 
         def validate_fresh():
             # The fingerprint uses the supplied path, not mutable symlink resolution.
-            launch_params["cwd"] = absolute_directory(cwd)
+            launch_params["cwd"] = self._directory(cwd)
             if sandbox_policy is not None:
-                validate_workspace_roots(sandbox_policy)
+                self._check_roots(sandbox_policy)
 
         async def action(receipt):
             if app_server_project_id is not None:
@@ -313,6 +403,13 @@ class Bridge:
         reasoning_effort: str | None = None,
         app_server_project_id: str | None = None,
     ):
+        if self.remote:
+            raise ValueError(
+                "create_worktree_thread is disabled in remote mode: it would run git on the "
+                "bridge host, not on the App Server host. Create the worktree on the remote "
+                "host yourself, then use create_thread with cwd inside it. (Future work: create "
+                "it through the App Server's command/exec.)"
+            )
         if worktree_mode != "bridge-managed-retained":
             raise ValueError("Explicit bridge-managed-retained worktree ownership is required")
         validate_sandbox_policy(expected_sandbox_policy)
@@ -559,6 +656,7 @@ class Bridge:
         nonempty(thread_id, "thread_id", 128)
         validate_sandbox_policy(sandbox_policy)
         validate_execution_policy(approval_policy, approvals_reviewer)
+        self._check_remote_policy(None, sandbox_policy, approval_policy)
         if (
             set(expected_identity) != {"thread_id", "cwd", "model", "reasoning_effort"}
             or expected_identity["thread_id"] != thread_id
@@ -576,6 +674,7 @@ class Bridge:
 
         async def action(receipt):
             receipt["threadId"] = thread_id
+            await self._remote_thread(thread_id)
             await self._apply_permissions(
                 receipt,
                 thread_id,
@@ -590,7 +689,7 @@ class Bridge:
             "update_thread_permissions",
             params,
             action,
-            validate_fresh=lambda: validate_workspace_roots(sandbox_policy),
+            validate_fresh=lambda: self._check_roots(sandbox_policy),
         )
 
     async def send_message_to_thread(self, request_id: str, thread_id: str, message: str):
@@ -600,6 +699,7 @@ class Bridge:
         async def action(receipt):
             receipt["threadId"] = thread_id
             self.ledger.save(receipt)
+            await self._remote_thread(thread_id)
             state = await self.rpc.call("thread/read", {"threadId": thread_id})
             if state["thread"].get("status", {}).get("type") == "active":
                 raise RpcError(
@@ -620,6 +720,7 @@ class Bridge:
             )
             receipt["resumed"] = resumed
             self.ledger.save(receipt)
+            self._check_remote_sandbox(resumed)
             if resumed.get("approvalPolicy") != "never" and not (
                 resumed.get("approvalPolicy") == "on-request"
                 and resumed.get("approvalsReviewer") == "auto_review"
@@ -664,6 +765,7 @@ class Bridge:
             receipt["threadId"] = thread_id
             receipt["expectedTurnId"] = expected_turn_id
             self.ledger.save(receipt)
+            await self._remote_thread(thread_id)
             result = await self.rpc.call(
                 "turn/steer",
                 {
@@ -694,7 +796,7 @@ class Bridge:
             raise ValueError("limit must be between 1 and 100")
         params = {"limit": limit, "useStateDbOnly": True}
         if cwd is not None:
-            params["cwd"] = absolute_directory(cwd)
+            params["cwd"] = self._directory(cwd)
         if cursor is not None:
             params["cursor"] = cursor
         return clipped(await self.rpc.call("thread/list", params), 4000)
@@ -760,3 +862,108 @@ class Bridge:
             },
             4000,
         )
+
+    # --- charm-codex additions (references/upstream-sync.md, patch 3) ---------------------------
+
+    async def interrupt_turn(self, thread_id: str, turn_id: str):
+        """Ask the App Server to interrupt one turn. Idempotent; no ledger receipt."""
+        nonempty(thread_id, "thread_id", 128)
+        nonempty(turn_id, "turn_id", 128)
+        await self._remote_thread(thread_id)
+        result = await self.rpc.call("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+        return {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "interruptRequested": True,
+            "result": result,
+            "note": "Accepted means requested; poll wait_thread for status interrupted.",
+        }
+
+    async def _find_turn(self, thread_id, turn_id, pages=5):
+        cursor = None
+        for _ in range(pages):
+            params = {"threadId": thread_id, "limit": 100, "itemsView": "full"}
+            if cursor is not None:
+                params["cursor"] = cursor
+            page = await self.rpc.call("thread/turns/list", params)
+            for turn in page.get("data", []):
+                if turn.get("id") == turn_id:
+                    return turn
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+        return None
+
+    async def get_turn_result(self, thread_id: str, turn_id: str, max_text_chars: int = 20_000):
+        """Final agent message, fileChange diffs, command summary and declines of one turn."""
+        nonempty(thread_id, "thread_id", 128)
+        nonempty(turn_id, "turn_id", 128)
+        if not 100 <= max_text_chars <= 200_000:
+            raise ValueError("max_text_chars must be 100–200000")
+        await self._remote_thread(thread_id)
+        turn = await self._find_turn(thread_id, turn_id)
+        declined = self.rpc.declined_for(thread_id, turn_id)
+        if turn is None:
+            return {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "found": False,
+                "observation": "not found in the newest 500 turns",
+                "declinedRequests": declined,
+            }
+        items = [item for item in turn.get("items") or [] if isinstance(item, dict)]
+
+        def cut(value):
+            if isinstance(value, str) and len(value) > max_text_chars:
+                return (
+                    value[:max_text_chars]
+                    + f"\n[truncated; original length {len(value)} characters]"
+                )
+            return value
+
+        messages = [item for item in items if item.get("type") == "agentMessage"]
+        file_changes = []
+        for item in items:
+            if item.get("type") != "fileChange":
+                continue
+            changes = item.get("changes")
+            file_changes.append(
+                {
+                    "id": item.get("id"),
+                    "status": item.get("status"),
+                    "changes": [
+                        {
+                            "path": change.get("path"),
+                            "kind": change.get("kind"),
+                            "diff": cut(change.get("diff")),
+                        }
+                        if isinstance(change, dict)
+                        else change
+                        for change in (changes if isinstance(changes, list) else [])
+                    ],
+                }
+            )
+        commands = [
+            {
+                "command": cut(item.get("command")),
+                "status": item.get("status"),
+                "exitCode": item.get("exitCode"),
+            }
+            for item in items
+            if item.get("type") == "commandExecution"
+        ]
+        status = turn.get("status")
+        return {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "found": True,
+            "status": status,
+            "terminal": status in TERMINAL_STATUSES,
+            "error": turn.get("error"),
+            "finalAgentMessage": cut(messages[-1].get("text")) if messages else None,
+            "fileChanges": file_changes,
+            "commands": commands,
+            "declinedRequests": declined,
+            "note": "fileChange diffs are the inner agent's account; verify the real working "
+            "tree diff independently.",
+        }

@@ -27,6 +27,11 @@ class FakeServer:
         self.pause_after = None
         self.paused = asyncio.Event()
         self.release = asyncio.Event()
+        # remote-mode additions
+        self.turn_items = []  # extra items appended to every new turn
+        self.server_requests = []  # (method, params) sent to the client on turn/start
+        self.client_replies = []  # replies the client sent to those requests
+        self._awaiting = {}  # request id -> (thread id, turn id)
 
     def cursor(self, offset):
         return f"{offset}:" + "x" * self.cursor_padding
@@ -45,6 +50,12 @@ class FakeServer:
         async for raw in ws:
             message = json.loads(raw)
             if "method" not in message:
+                self.client_replies.append(message)
+                waiting = self._awaiting.pop(message.get("id"), None)
+                if waiting and not any(w == waiting for w in self._awaiting.values()):
+                    for turn in self.threads[waiting[0]]["turns"]:
+                        if turn["id"] == waiting[1]:
+                            turn["status"] = "completed"
                 continue
             method, params = message["method"], message.get("params", {})
             self.calls.append((method, params))
@@ -116,8 +127,31 @@ class FakeServer:
                         }
                     ],
                 }
+                turn["items"].extend(self.turn_items)
                 thread["turns"].append(turn)
-                result = {"turn": turn}
+                result = {"turn": dict(turn)}
+                for number, (name, request_params) in enumerate(self.server_requests, 1):
+                    turn["status"] = "inProgress"
+                    ident_out = f"srv-{len(self.calls)}-{number}"
+                    self._awaiting[ident_out] = (params["threadId"], turn["id"])
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "id": ident_out,
+                                "method": name,
+                                "params": {
+                                    "threadId": params["threadId"],
+                                    "turnId": turn["id"],
+                                    **request_params,
+                                },
+                            }
+                        )
+                    )
+            elif method == "turn/interrupt":
+                for turn in self.threads[params["threadId"]]["turns"]:
+                    if turn["id"] == params["turnId"]:
+                        turn["status"] = "interrupted"
+                result = {}
             elif method == "turn/steer":
                 thread = self.threads[params["threadId"]]
                 turn = thread["turns"][-1] if thread["turns"] else None

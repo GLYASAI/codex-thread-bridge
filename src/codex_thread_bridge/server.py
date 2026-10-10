@@ -30,7 +30,8 @@ def make_server(bridge: Bridge):
     mcp = FastMCP(
         "codex-thread-bridge",
         instructions=(
-            "Create, message, and steer Codex sessions on this host using its App Server. "
+            "Create, message, steer and interrupt Codex sessions using a running App Server "
+            "(on this host, or on a remote host in remote mode). "
             "Get user authorization before mutations. Use a stable request_id for each intended "
             "mutation; reuse it after an uncertain response and inspect get_operation. Never use "
             "a new ID to blindly retry. Accepted means dispatched, not completed. No automatic "
@@ -214,6 +215,26 @@ def make_server(bridge: Bridge):
         """
         return await bridge.wait_thread(thread_id, turn_id, timeout_seconds)
 
+    @mcp.tool(annotations=WRITE)
+    async def interrupt_turn(thread_id: str, turn_id: str) -> dict[str, Any]:
+        """Request interruption of one running turn (turn/interrupt). Does not start new work.
+
+        Requires the explicit thread and turn IDs. Accepted means requested; use wait_thread to
+        see status interrupted. Interrupting an already finished turn is harmless.
+        """
+        return await bridge.interrupt_turn(thread_id, turn_id)
+
+    @mcp.tool(annotations=READ)
+    async def get_turn_result(
+        thread_id: str, turn_id: str, max_text_chars: int = 20000
+    ) -> dict[str, Any]:
+        """Final agent message, fileChange diffs, command summary and declined requests of a turn.
+
+        Reads without resuming. The diffs are what the inner agent reports; verify the actual
+        working tree independently. Text is truncated (marked) at max_text_chars per field.
+        """
+        return await bridge.get_turn_result(thread_id, turn_id, max_text_chars)
+
     @mcp.tool(annotations=READ)
     async def get_goal(thread_id: str) -> dict[str, Any]:
         """Read persistent Goal state without modifying it; text over 4000 characters is marked."""
@@ -250,10 +271,32 @@ def main():
         help="Control socket transport (auto uses the CLI proxy on Windows)",
     )
     parser.add_argument("--codex-binary", help="Codex CLI path for the proxy transport")
+    parser.add_argument(
+        "--remote-root",
+        help="Remote mode: the App Server is on another host (e.g. behind an ssh socket forward). "
+        "Skip local filesystem checks; require cwd/writable roots under this absolute POSIX path; "
+        "allow only read-only/workspace-write with approval never; decline and record server "
+        "requests; disable create_worktree_thread.",
+    )
+    parser.add_argument(
+        "--endpoint-id",
+        help="Stable name keying the operation ledger instead of the socket path (remote mode)",
+    )
     args = parser.parse_args()
-    socket_path, ledger = open_endpoint_ledger(args.socket, args.state_dir)
+    socket_path, ledger = open_endpoint_ledger(args.socket, args.state_dir, args.endpoint_id)
+    remote = args.remote_root is not None
     bridge = Bridge(
-        AppServer(socket_path, transport=args.transport, codex_binary=args.codex_binary), ledger
+        AppServer(
+            socket_path,
+            transport=args.transport,
+            codex_binary=args.codex_binary,
+            decline_server_requests=remote,
+            declined_log=args.state_dir.expanduser() / "declined-requests.jsonl"
+            if remote
+            else None,
+        ),
+        ledger,
+        remote_root=args.remote_root,
     )
     make_server(bridge).run(transport="stdio")
 

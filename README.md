@@ -130,3 +130,24 @@ behavior. Contribution requirements are in [CONTRIBUTING.md](CONTRIBUTING.md).
 - [Shared callback routing in Codex 0.153.4](https://github.com/openai/codex/blob/rust-v0.153.4/codex-rs/app-server/src/outgoing_message.rs)
 
 MIT licensed. Independent project, not affiliated with or endorsed by OpenAI.
+
+## Remote mode (fork patches)
+
+This fork adds `--remote-root /abs/posix/path` for an App Server on another host, typically
+reached through an `ssh -L <local.sock>:<remote.sock>` forward (`--socket <local.sock>
+--transport unix`). In remote mode:
+
+- no local filesystem checks; `cwd`, `list_threads(cwd)` and `writableRoots` must be clean absolute
+  POSIX paths equal to or under the remote root (no `..`, `.`, `//`, trailing `/`);
+- only `read-only` / `workspace-write` sandboxes and `approvalPolicy: never`; threads outside the
+  root, or resumed with another sandbox, are not driven;
+- server requests (approvals, user input, elicitation) are answered with a decline, unknown
+  ones with JSON-RPC `-32601`, so a turn never waits forever; each is recorded in memory and in
+  `<state-dir>/declined-requests.jsonl` and shown by `get_turn_result`;
+- `create_worktree_thread` is disabled (it would run the checkout on the bridge host; creating
+  the worktree through the App Server's `command/exec` is future work);
+- `--endpoint-id NAME` keys the operation ledger by name instead of by socket path.
+
+New tools (all modes): `interrupt_turn(thread_id, turn_id)` and
+`get_turn_result(thread_id, turn_id, max_text_chars=20000)` (final agent message, `fileChange`
+diffs, command summary, declined requests). Tests: `uv run pytest` (see `tests/test_remote.py`).

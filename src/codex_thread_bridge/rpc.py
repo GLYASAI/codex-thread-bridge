@@ -1,10 +1,12 @@
 """A multiplexed JSON-RPC client over Codex's local WebSocket control socket."""
 
 import asyncio
+import collections
 import contextlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,20 @@ from websockets.asyncio.client import unix_connect
 
 from . import __version__
 from .proxy_transport import ProxyWebSocket
+
+# Remote mode (references: README "Remote mode"): server requests are answered instead of ignored,
+# so a turn can never wait forever on an approval or user-input prompt nobody will answer.
+# Anything not listed gets a JSON-RPC -32601 error, which also unblocks the turn.
+DECLINE_RESULTS: dict[str, dict] = {
+    "item/commandExecution/requestApproval": {"decision": "decline"},
+    "item/fileChange/requestApproval": {"decision": "decline"},
+    "execCommandApproval": {"decision": "denied"},
+    "applyPatchApproval": {"decision": "denied"},
+    "item/tool/requestUserInput": {"answers": {}},
+    "mcpServer/elicitation/request": {"action": "decline"},
+}
+DECLINED_MEMORY = 200
+DECLINED_LOG_TAIL_BYTES = 1_000_000
 
 
 class RpcError(Exception):
@@ -32,6 +48,8 @@ class AppServer:
         timeout: float = 20,
         transport: str | None = None,
         codex_binary: str | None = None,
+        decline_server_requests: bool = False,
+        declined_log: Path | None = None,
     ):
         self.socket_path = socket_path
         self.timeout = timeout
@@ -45,6 +63,71 @@ class AppServer:
         self._counter = 0
         self._connect_lock = asyncio.Lock()
         self.info: dict[str, Any] = {}
+        self.decline_server_requests = decline_server_requests
+        self.declined_log = declined_log
+        self.declined: collections.deque = collections.deque(maxlen=DECLINED_MEMORY)
+
+    def _record_decline(self, message: dict[str, Any], answer: str):
+        params = message.get("params")
+        params = params if isinstance(params, dict) else {}
+        detail = (
+            params.get("command")
+            or params.get("reason")
+            or params.get("message")
+            or params.get("serverName")
+            or ""
+        )
+        record = {
+            "method": message.get("method"),
+            "threadId": params.get("threadId") or params.get("conversationId"),
+            "turnId": params.get("turnId"),
+            "detail": str(detail)[:300],
+            "answer": answer,
+            "at": round(time.time(), 3),
+        }
+        self.declined.append(record)
+        if self.declined_log is not None:
+            try:
+                self.declined_log.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                fd = os.open(self.declined_log, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+                with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record) + "\n")
+            except OSError:
+                pass  # in-memory record remains
+
+    def declined_for(self, thread_id: str, turn_id: str | None = None):
+        """Recorded declines for a thread (and turn, when the request named one)."""
+        records = list(self.declined)
+        if self.declined_log is not None:
+            try:
+                with open(self.declined_log, "rb") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    start = max(0, handle.tell() - DECLINED_LOG_TAIL_BYTES)
+                    handle.seek(start)
+                    lines = handle.read().decode("utf-8", "replace").splitlines()
+                    lines = lines[1:] if start else lines  # first line may be cut mid-record
+                records = [json.loads(line) for line in lines if line.strip()] or records
+            except (OSError, ValueError):
+                pass
+        return [
+            r
+            for r in records
+            if r.get("threadId") == thread_id
+            and (turn_id is None or r.get("turnId") in (None, turn_id))
+        ]
+
+    async def _answer_server_request(self, ws, message: dict[str, Any]):
+        method = message.get("method")
+        if method in DECLINE_RESULTS:
+            reply = {"id": message["id"], "result": DECLINE_RESULTS[method]}
+            self._record_decline(message, "declined")
+        else:
+            reply = {
+                "id": message["id"],
+                "error": {"code": -32601, "message": f"bridge does not handle {method}"},
+            }
+            self._record_decline(message, "unsupported (-32601)")
+        await ws.send(json.dumps(reply))
 
     async def connect(self):
         async with self._connect_lock:
@@ -96,6 +179,9 @@ class AppServer:
             async for raw in ws:
                 message = json.loads(raw)
                 if "method" in message:
+                    if self.decline_server_requests and "id" in message:
+                        await self._answer_server_request(ws, message)
+                        continue
                     # App Server shares server-request callbacks across subscribers;
                     # the first reply (even an error) consumes the callback. Leave
                     # these requests for a capable client subscribed to the thread.
