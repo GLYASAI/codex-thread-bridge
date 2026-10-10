@@ -18,6 +18,7 @@ class FakeServer:
         self.settings = {}
         self.reject = {}
         self.drop_after = None
+        self.drop_once = False
         self.override_creation = {}
         self.approval_policy = "never"
         self.complete_turns = True
@@ -227,6 +228,8 @@ class FakeServer:
                 await self.release.wait()
             await ws.send(json.dumps({"method": "thread/status/changed", "params": {}}))
             if method == self.drop_after:
+                if self.drop_once:
+                    self.drop_after = None
                 await ws.close()
                 return
             await ws.send(json.dumps({"id": ident, "result": result}))

@@ -146,6 +146,9 @@ reached through an `ssh -L <local.sock>:<remote.sock>` forward (`--socket <local
   `<state-dir>/declined-requests.jsonl` and shown by `get_turn_result`;
 - `create_worktree_thread` is disabled (it would run the checkout on the bridge host; creating
   the worktree through the App Server's `command/exec` is future work);
+- read-only requests (`thread/read`, `thread/list`, `thread/turns/list`, ...) are retried once on a
+  fresh connection if the connection drops (relays may close idle connections), so `wait_thread`
+  survives it; mutations are never resent;
 - `--endpoint-id NAME` keys the operation ledger by name instead of by socket path.
 
 New tools (all modes): `interrupt_turn(thread_id, turn_id)` and

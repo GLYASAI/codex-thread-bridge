@@ -19,6 +19,7 @@ async def remote(fake_server, tmp_path):
         socket,
         timeout=2,
         decline_server_requests=True,
+        retry_reads=True,
         declined_log=tmp_path / "state" / "declined.jsonl",
     )
     ledger = Ledger(tmp_path / "state" / "operations.sqlite3")
@@ -312,3 +313,29 @@ def test_endpoint_id_keys_the_ledger_not_the_socket_path(tmp_path):
 
 def test_rpc_error_type_is_exported():
     assert issubclass(RpcError, Exception)
+
+
+async def test_read_is_retried_once_after_connection_drop(remote):
+    fake, bridge, _ = remote
+    created = await bridge.create_thread("e1", "/code/x", "work", sandbox="read-only")
+    fake.drop_after, fake.drop_once = "thread/turns/list", True
+    waited = await bridge.wait_thread(created["threadId"], created["turnId"], 5)
+    assert waited["turn"]["status"] == "completed"
+    assert fake.count("thread/turns/list") == 2
+
+
+async def test_mutation_is_not_resent_after_connection_drop(remote):
+    fake, bridge, _ = remote
+    fake.drop_after, fake.drop_once = "thread/start", True
+    receipt = await bridge.create_thread("e2", "/code/x", "work", sandbox="read-only")
+    assert receipt["status"] == "outcome_unknown"
+    assert fake.count("thread/start") == 1
+
+
+async def test_idle_connection_closed_by_relay_reconnects(remote):
+    fake, bridge, rpc = remote
+    await bridge.list_threads()
+    await rpc._ws.close()  # what a relay idle timeout looks like to the client
+    await asyncio.sleep(0.1)
+    await bridge.list_threads()
+    assert fake.count("initialize") == 2

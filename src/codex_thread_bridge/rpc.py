@@ -26,6 +26,9 @@ DECLINE_RESULTS: dict[str, dict] = {
     "item/tool/requestUserInput": {"answers": {}},
     "mcpServer/elicitation/request": {"action": "decline"},
 }
+READ_ONLY_METHODS = frozenset(
+    {"thread/read", "thread/list", "thread/turns/list", "thread/goal/get", "project/read"}
+)
 DECLINED_MEMORY = 200
 DECLINED_LOG_TAIL_BYTES = 1_000_000
 
@@ -49,6 +52,7 @@ class AppServer:
         transport: str | None = None,
         codex_binary: str | None = None,
         decline_server_requests: bool = False,
+        retry_reads: bool = False,
         declined_log: Path | None = None,
     ):
         self.socket_path = socket_path
@@ -64,6 +68,7 @@ class AppServer:
         self._connect_lock = asyncio.Lock()
         self.info: dict[str, Any] = {}
         self.decline_server_requests = decline_server_requests
+        self.retry_reads = retry_reads
         self.declined_log = declined_log
         self.declined: collections.deque = collections.deque(maxlen=DECLINED_MEMORY)
 
@@ -225,7 +230,16 @@ class AppServer:
 
     async def call(self, method: str, params: dict[str, Any] | None):
         await self.connect()
-        # Reconnect before a new request, never retry an already-sent request.
+        # Reconnect before a new request, never retry an already-sent mutation.
+        try:
+            return await self._request(method, params)
+        except TransportError:
+            # Idle connections may be closed by a relay (e.g. after ~300s). Pure reads are safe
+            # to repeat once on a fresh connection; mutations are never resent.
+            if not self.retry_reads or method not in READ_ONLY_METHODS:
+                raise
+        await self.close()
+        await self.connect()
         return await self._request(method, params)
 
     async def close(self):

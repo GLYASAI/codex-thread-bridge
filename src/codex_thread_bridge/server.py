@@ -291,6 +291,7 @@ def main():
             transport=args.transport,
             codex_binary=args.codex_binary,
             decline_server_requests=remote,
+            retry_reads=remote,
             declined_log=args.state_dir.expanduser() / "declined-requests.jsonl"
             if remote
             else None,
