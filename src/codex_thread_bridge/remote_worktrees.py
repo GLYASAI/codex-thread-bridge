@@ -70,7 +70,7 @@ def git_argv(root: str, *args: str) -> list[str]:
 
 def add_argv(root: str, path: str, base_ref: str, branch: str | None) -> list[str]:
     mode = ["-b", branch, "--no-track"] if branch else ["--detach"]
-    return git_argv(root, "worktree", "add", *mode, "--", path, base_ref)
+    return git_argv(root, "worktree", "add", "--quiet", *mode, "--", path, base_ref)
 
 
 def remove_argv(root: str, path: str, force: bool) -> list[str]:

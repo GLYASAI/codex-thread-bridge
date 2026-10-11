@@ -75,10 +75,10 @@ def test_branch_rejects(branch):
 def test_argv_forms_are_fixed():
     p = f"{WT}/t1"
     assert rw.add_argv(ROOT, p, "origin/dev", None) == [
-        "git", "-C", ROOT, "worktree", "add", "--detach", "--", p, "origin/dev"
+        "git", "-C", ROOT, "worktree", "add", "--quiet", "--detach", "--", p, "origin/dev"
     ]  # fmt: skip
     assert rw.add_argv(ROOT, p, "origin/dev", "cl/x/y") == [
-        "git", "-C", ROOT, "worktree", "add", "-b", "cl/x/y", "--no-track", "--", p, "origin/dev"
+        "git", "-C", ROOT, "worktree", "add", "--quiet", "-b", "cl/x/y", "--no-track", "--", p, "origin/dev"
     ]  # fmt: skip
     assert rw.remove_argv(ROOT, p, False) == ["git", "-C", ROOT, "worktree", "remove", "--", p]
     assert rw.remove_argv(ROOT, p, True)[4:6] == ["remove", "--force"]
@@ -113,7 +113,7 @@ async def test_create_detached_runs_exec_then_starts_thread(remote):
     assert receipt["status"] == "accepted", receipt
     add, head = execs(fake)
     assert add["command"] == [
-        "git", "-C", ROOT, "worktree", "add", "--detach", "--", f"{WT}/smoke", "origin/dev"
+        "git", "-C", ROOT, "worktree", "add", "--quiet", "--detach", "--", f"{WT}/smoke", "origin/dev"
     ]  # fmt: skip
     assert add["cwd"] == ROOT
     assert add["sandboxPolicy"] == rw.write_sandbox(ROOT)
@@ -136,7 +136,7 @@ async def test_create_with_branch(remote):
         "c2", "t2", "origin/dev", "workspace-write", branch="cl/huangrunhao/topic"
     )
     assert receipt["status"] == "accepted"
-    assert execs(fake)[0]["command"][5:8] == ["-b", "cl/huangrunhao/topic", "--no-track"]
+    assert execs(fake)[0]["command"][6:9] == ["-b", "cl/huangrunhao/topic", "--no-track"]
     assert fake.count("turn/start") == 0  # no prompt, no turn
 
 
