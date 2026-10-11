@@ -205,7 +205,9 @@ class AppServer:
                 if not future.done():
                     future.set_exception(TransportError(failure))
 
-    async def _request(self, method: str, params: dict[str, Any] | None):
+    async def _request(
+        self, method: str, params: dict[str, Any] | None, timeout: float | None = None
+    ):
         ws = self._ws
         if ws is None:
             raise TransportError("App Server is not connected")
@@ -215,7 +217,7 @@ class AppServer:
         self._pending[ident] = future
         try:
             await ws.send(json.dumps({"id": ident, "method": method, "params": params}))
-            message = await asyncio.wait_for(future, self.timeout)
+            message = await asyncio.wait_for(future, timeout or self.timeout)
         except (OSError, TimeoutError) as error:
             raise TransportError(f"{method}: response unavailable; do not resend") from error
         finally:
@@ -228,11 +230,13 @@ class AppServer:
             raise TransportError(f"{method}: invalid response; outcome unknown")
         return message["result"]
 
-    async def call(self, method: str, params: dict[str, Any] | None):
+    async def call(
+        self, method: str, params: dict[str, Any] | None, timeout: float | None = None
+    ):
         await self.connect()
         # Reconnect before a new request, never retry an already-sent mutation.
         try:
-            return await self._request(method, params)
+            return await self._request(method, params, timeout)
         except TransportError:
             # Idle connections may be closed by a relay (e.g. after ~300s). Pure reads are safe
             # to repeat once on a fresh connection; mutations are never resent.
@@ -240,7 +244,7 @@ class AppServer:
                 raise
         await self.close()
         await self.connect()
-        return await self._request(method, params)
+        return await self._request(method, params, timeout)
 
     async def close(self):
         if self._ws is not None:

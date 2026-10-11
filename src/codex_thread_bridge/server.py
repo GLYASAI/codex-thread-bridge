@@ -245,6 +245,54 @@ def make_server(bridge: Bridge):
         """Read a mutation receipt, including known IDs after partial or uncertain delivery."""
         return bridge.ledger.get(request_id)
 
+    if bridge.remote:
+        # Remote mode swaps the local worktree tool for command/exec based ones. They run only
+        # fixed `git worktree` argv under <remote-root>/.worktrees; there is no generic exec tool.
+        mcp.remove_tool("create_worktree_thread")
+
+        @mcp.tool(annotations=WRITE)
+        async def create_worktree_thread(
+            request_id: str,
+            name: str,
+            base_ref: str,
+            sandbox: Literal["read-only", "workspace-write"] = "read-only",
+            branch: str | None = None,
+            prompt: str | None = None,
+            title: str | None = None,
+            model: str | None = None,
+            reasoning_effort: str | None = None,
+        ) -> dict[str, Any]:
+            """Create <repo_root>/.worktrees/<name> on the App Server host and start a task in it.
+
+            Runs `git -C <repo_root> worktree add` through the App Server's command/exec (fixed
+            argv, minimal sandbox that can write only .git and .worktrees). name must match
+            ^[a-z0-9][a-z0-9._-]{0,63}$. base_ref is required (e.g. origin/dev; no fetch is done).
+            With branch, creates that new branch (no upstream tracking); without, a detached
+            checkout. The task then starts with that cwd, approval never, runtime workspace root
+            = the worktree. Reuse request_id after uncertainty (receipts replay). Failures return
+            git's exit code/stdout/stderr in the receipt (worktree.add); nothing is removed
+            automatically, use remove_worktree.
+            """
+            return await bridge.create_remote_worktree_thread(
+                request_id, name, base_ref, sandbox, branch, prompt, title, model, reasoning_effort
+            )
+
+        @mcp.tool(annotations=WRITE)
+        async def remove_worktree(name: str, force: bool = False) -> dict[str, Any]:
+            """Run `git worktree remove` for <repo_root>/.worktrees/<name> on the App Server host.
+
+            Only registered worktrees directly under <repo_root>/.worktrees/ are accepted. No
+            --force unless force=true (needed for dirty worktrees; discards uncommitted work).
+            Does not delete branches or stop threads using the worktree.
+            """
+            return await bridge.remove_worktree(name, force)
+
+        @mcp.tool(annotations=READ)
+        async def list_worktrees() -> dict[str, Any]:
+            """List the repository's worktrees (`git worktree list --porcelain`) with a
+            `managed` flag for those under <repo_root>/.worktrees/."""
+            return await bridge.list_worktrees()
+
     return mcp
 
 
@@ -276,7 +324,7 @@ def main():
         help="Remote mode: the App Server is on another host (e.g. behind an ssh socket forward). "
         "Skip local filesystem checks; require cwd/writable roots under this absolute POSIX path; "
         "allow only read-only/workspace-write with approval never; decline and record server "
-        "requests; disable create_worktree_thread.",
+        "requests; manage worktrees under <root>/.worktrees through the App Server's command/exec.",
     )
     parser.add_argument(
         "--endpoint-id",

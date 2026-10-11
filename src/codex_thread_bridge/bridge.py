@@ -1,11 +1,14 @@
 """Tool behavior, independent of MCP transport and the installed client."""
 
 import asyncio
+import contextlib
 import posixpath
+import uuid
 from pathlib import Path, PurePosixPath
 
+from . import remote_worktrees as rw
 from .ledger import Ledger
-from .rpc import AppServer, RpcError
+from .rpc import AppServer, RpcError, TransportError
 from .worktrees import Worktree, WorktreeError
 
 
@@ -400,10 +403,8 @@ class Bridge:
     ):
         if self.remote:
             raise ValueError(
-                "create_worktree_thread is disabled in remote mode: it would run git on the "
-                "bridge host, not on the App Server host. Create the worktree on the remote "
-                "host yourself, then use create_thread with cwd inside it. (Future work: create "
-                "it through the App Server's command/exec.)"
+                "The local create_worktree_thread form is unavailable in remote mode; use "
+                "create_remote_worktree_thread (MCP: create_worktree_thread with name/base_ref)."
             )
         if worktree_mode != "bridge-managed-retained":
             raise ValueError("Explicit bridge-managed-retained worktree ownership is required")
@@ -543,6 +544,198 @@ class Bridge:
                 raise WorktreeError(
                     "Worktree changed during thread startup; initial prompt withheld"
                 )
+            if prompt is not None:
+                checkpoint("dispatching_initial_prompt", initialPrompt={"state": "outcome_unknown"})
+                turn = await self.rpc.call(
+                    "turn/start",
+                    {
+                        "threadId": receipt["threadId"],
+                        "input": [{"type": "text", "text": prompt}],
+                    },
+                )
+                checkpoint(
+                    "initial_prompt_accepted",
+                    turnId=turn["turn"]["id"],
+                    initialPrompt={"state": "accepted"},
+                )
+            checkpoint("complete", recoveryRequired=False)
+
+        return await self._mutate(request_id, "create_worktree_thread", params, action)
+
+    # --- remote worktrees through the App Server's command/exec ------------------------------
+    async def _git_exec(self, argv, sandbox_policy, timeout_s=60):
+        """Run one fixed git argv on the App Server host. Returns the exec result dict."""
+        process_id = f"ctb-{uuid.uuid4().hex}"
+        params = {
+            "command": argv,
+            "cwd": self.remote_root,
+            "env": rw.GIT_ENV,
+            "sandboxPolicy": sandbox_policy,
+            "timeoutMs": int(timeout_s * 1000),
+            "processId": process_id,
+        }
+        try:
+            result = await self.rpc.call("command/exec", params, timeout=timeout_s + 15)
+        except TransportError:
+            with contextlib.suppress(Exception):
+                await self.rpc.call("command/exec/terminate", {"processId": process_id})
+            raise
+        return {
+            "argv": argv,
+            "exitCode": result.get("exitCode"),
+            "stdout": clipped(result.get("stdout", ""), 8000, display_text=True),
+            "stderr": clipped(result.get("stderr", ""), 8000, display_text=True),
+        }
+
+    def _require_remote(self, tool):
+        if not self.remote:
+            raise ValueError(f"{tool} is available only in remote mode (--remote-root)")
+
+    async def _registered_worktrees(self):
+        listing = await self._git_exec(rw.list_argv(self.remote_root), rw.READ_SANDBOX, 30)
+        if listing["exitCode"] != 0:
+            return listing, None
+        return listing, rw.parse_porcelain(listing["stdout"], self.remote_root)
+
+    async def list_worktrees(self):
+        self._require_remote("list_worktrees")
+        listing, entries = await self._registered_worktrees()
+        if entries is None:
+            return {"status": "failed", "command": listing}
+        return {"status": "ok", "repoRoot": self.remote_root, "worktrees": entries}
+
+    async def remove_worktree(self, name: str, force: bool = False):
+        self._require_remote("remove_worktree")
+        path = rw.worktree_path(self.remote_root, name)
+        if not isinstance(force, bool):
+            raise ValueError("force must be a boolean")
+        async with self._mutation_lock:
+            listing, entries = await self._registered_worktrees()
+            if entries is None:
+                return {"status": "failed", "command": listing}
+            if not any(entry["path"] == path for entry in entries):
+                raise ValueError(f"{path} is not a registered worktree of {self.remote_root}")
+            removal = await self._git_exec(
+                rw.remove_argv(self.remote_root, path, force), rw.write_sandbox(self.remote_root)
+            )
+        if removal["exitCode"] != 0:
+            return {"status": "failed", "path": path, "command": removal}
+        return {"status": "removed", "path": path, "forced": force, "command": removal}
+
+    async def create_remote_worktree_thread(
+        self,
+        request_id: str,
+        name: str,
+        base_ref: str,
+        sandbox: str,
+        branch: str | None = None,
+        prompt: str | None = None,
+        title: str | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ):
+        self._require_remote("create_worktree_thread")
+        path = rw.worktree_path(self.remote_root, name)
+        rw.validate_ref(base_ref, "base_ref")
+        if branch is not None:
+            rw.validate_branch(branch)
+        self._check_remote_policy(sandbox=sandbox)
+        if sandbox not in REMOTE_SANDBOXES:
+            raise ValueError("sandbox must be read-only or workspace-write")
+        for label, value in [
+            ("prompt", prompt),
+            ("title", title),
+            ("model", model),
+            ("reasoning_effort", reasoning_effort),
+        ]:
+            if value is not None:
+                nonempty(value, label)
+        params = {
+            "name": name,
+            "base_ref": base_ref,
+            "branch": branch,
+            "sandbox": sandbox,
+            "prompt": prompt,
+            "title": title,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+        }
+
+        async def action(receipt):
+            def checkpoint(phase, **fields):
+                receipt.update(phase=phase, **fields)
+                self.ledger.save(receipt)
+
+            checkpoint(
+                "creating_worktree",
+                recoveryRequired=True,
+                recovery="Inspect this receipt, list_worktrees and list_threads before manual "
+                "recovery. Retain artifacts; do not retry with a new request ID.",
+                worktree={"path": path, "baseRef": base_ref, "branch": branch, "state": "planned"},
+            )
+            added = await self._git_exec(
+                rw.add_argv(self.remote_root, path, base_ref, branch),
+                rw.write_sandbox(self.remote_root),
+                timeout_s=180,
+            )
+            receipt["worktree"]["add"] = added
+            if added["exitCode"] != 0:
+                raise WorktreeError(
+                    f"git worktree add failed (exit {added['exitCode']}): "
+                    f"{added['stderr'] or added['stdout']}"
+                )
+            receipt["worktree"]["state"] = "created"
+            head = await self._git_exec(rw.head_argv(path), rw.READ_SANDBOX, 30)
+            if head["exitCode"] != 0:
+                raise WorktreeError(f"new worktree is not usable: {head['stderr']}")
+            receipt["worktree"]["head"] = head["stdout"].strip()
+            checkpoint("creating_thread")
+            launch = {
+                "cwd": path,
+                "sandbox": sandbox,
+                "approvalPolicy": "never",
+                "ephemeral": False,
+                "runtimeWorkspaceRoots": [path],
+            }
+            if model is not None:
+                launch["model"] = model
+            if reasoning_effort is not None:
+                launch["config"] = {"model_reasoning_effort": reasoning_effort}
+            created = await self.rpc.call("thread/start", launch)
+            checkpoint(
+                "checking_environment",
+                threadId=created["thread"]["id"],
+                creation=created,
+                permissionReceipt={
+                    key: created.get(key)
+                    for key in (
+                        "approvalPolicy",
+                        "sandbox",
+                        "activePermissionProfile",
+                        "runtimeWorkspaceRoots",
+                    )
+                },
+            )
+            if (
+                created.get("cwd") != path
+                or created["thread"].get("cwd") != path
+                or created.get("approvalPolicy") != "never"
+                or (created.get("sandbox") or {}).get("type") != SANDBOX_POLICY_TYPES[sandbox]
+                or (model is not None and created.get("model") != model)
+                or (
+                    reasoning_effort is not None
+                    and created.get("reasoningEffort") != reasoning_effort
+                )
+            ):
+                raise WorktreeError(
+                    "Created environment differs; initial prompt withheld. Inspect creation receipt"
+                )
+            if title is not None:
+                checkpoint("naming_thread")
+                await self.rpc.call(
+                    "thread/name/set", {"threadId": receipt["threadId"], "name": title}
+                )
+                checkpoint("thread_named", title=title)
             if prompt is not None:
                 checkpoint("dispatching_initial_prompt", initialPrompt={"state": "outcome_unknown"})
                 turn = await self.rpc.call(

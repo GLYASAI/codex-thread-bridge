@@ -33,6 +33,34 @@ class FakeServer:
         self.server_requests = []  # (method, params) sent to the client on turn/start
         self.client_replies = []  # replies the client sent to those requests
         self._awaiting = {}  # request id -> (thread id, turn id)
+        self.worktrees = {}  # command/exec simulator state: path -> {head, branch}
+        self.exec_fail = {}  # "worktree add" -> (exit code, stderr)
+
+    def exec(self, params):
+        """Tiny `git worktree` simulator for command/exec. exec_fail["worktree add"] = (code, err)."""
+        argv = params["command"]
+        assert argv[:2] == ["git", "-C"], argv
+        repo, verb = argv[2], argv[3:5]
+        fail = self.exec_fail.get(" ".join(verb))
+        if fail:
+            return {"exitCode": fail[0], "stdout": "", "stderr": fail[1]}
+        if verb == ["worktree", "add"]:
+            path = argv[-2]
+            branch = argv[argv.index("-b") + 1] if "-b" in argv else None
+            self.worktrees[path] = {"head": "a" * 40, "branch": branch}
+            return {"exitCode": 0, "stdout": "", "stderr": f"Preparing worktree ({path})\n"}
+        if verb == ["worktree", "list"]:
+            text = f"worktree {repo}\nHEAD {'b' * 40}\nbranch refs/heads/dev\n\n"
+            for path, info in self.worktrees.items():
+                text += f"worktree {path}\nHEAD {info['head']}\n"
+                text += f"branch refs/heads/{info['branch']}\n\n" if info["branch"] else "detached\n\n"
+            return {"exitCode": 0, "stdout": text, "stderr": ""}
+        if verb == ["worktree", "remove"]:
+            self.worktrees.pop(argv[-1], None)
+            return {"exitCode": 0, "stdout": "", "stderr": ""}
+        if argv[3:5] == ["rev-parse", "HEAD"]:
+            return {"exitCode": 0, "stdout": self.worktrees[repo]["head"] + "\n", "stderr": ""}
+        return {"exitCode": 127, "stdout": "", "stderr": f"unexpected {argv}"}
 
     def cursor(self, offset):
         return f"{offset}:" + "x" * self.cursor_padding
@@ -213,6 +241,10 @@ class FakeServer:
                 }
             elif method == "thread/goal/get":
                 result = {"goal": self.goal}
+            elif method == "command/exec":
+                result = self.exec(params)
+            elif method == "command/exec/terminate":
+                result = {}
             elif method == "project/read":
                 result = {"project": {"id": params["projectId"]}}
             else:

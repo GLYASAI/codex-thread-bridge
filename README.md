@@ -143,8 +143,14 @@ reached through an `ssh -L <local.sock>:<remote.sock>` forward (`--socket <local
 - server requests (approvals, user input, elicitation) are answered with a decline, unknown
   ones with JSON-RPC `-32601`, so a turn never waits forever; each is recorded in memory and in
   `<state-dir>/declined-requests.jsonl` and shown by `get_turn_result`;
-- `create_worktree_thread` is disabled (it would run the checkout on the bridge host; creating
-  the worktree through the App Server's `command/exec` is future work);
+- worktrees are managed on the App Server host through `command/exec` (fixed `git worktree`
+  argv, never a shell string, sandbox `workspaceWrite` limited to `<root>/.git` and
+  `<root>/.worktrees`, timeout enforced by the server). `create_worktree_thread(request_id, name,
+  base_ref, sandbox, branch?, prompt?, title?, model?, reasoning_effort?)` replaces the local form
+  and creates `<root>/.worktrees/<name>` (`name` = `^[a-z0-9][a-z0-9._-]{0,63}$`; `base_ref`
+  required, no fetch; `branch` makes a new branch without upstream, otherwise `--detach`);
+  `remove_worktree(name, force=false)` only removes registered worktrees directly under
+  `.worktrees/`; `list_worktrees()` lists them. There is no generic command tool;
 - read-only requests (`thread/read`, `thread/list`, `thread/turns/list`, ...) are retried once on a
   fresh connection if the connection drops (relays may close idle connections), so `wait_thread`
   survives it; mutations are never resent;

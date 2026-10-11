@@ -113,9 +113,9 @@ async def test_remote_writable_roots_must_be_under_root(remote):
         )
 
 
-async def test_create_worktree_thread_is_disabled_in_remote_mode(remote):
+async def test_local_worktree_form_is_unavailable_in_remote_mode(remote):
     fake, bridge, _ = remote
-    with pytest.raises(ValueError, match="disabled in remote mode.*command/exec"):
+    with pytest.raises(ValueError, match="local create_worktree_thread form is unavailable"):
         await bridge.create_worktree_thread(
             "w1", "/code", "a" * 40, "/code/.worktrees/w", "bridge-managed-retained",
             "read-only", {"type": "readOnly", "networkAccess": False},
