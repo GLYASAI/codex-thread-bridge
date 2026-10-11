@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import os
-import signal
 import socket
 import stat
 from pathlib import Path
+
 
 class TransportConfigError(Exception):
     """The socket path does not meet the safety requirements."""
@@ -87,17 +87,17 @@ def build_app(mcp):
 async def serve(app, sock: socket.socket, socket_path: Path) -> None:
     import uvicorn
 
-    config = uvicorn.Config(
-        app, fd=sock.fileno(), log_level="warning", lifespan="on", server_header=False
-    )
-    server = uvicorn.Server(config)
-    loop = asyncio.get_running_loop()
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        # Stop gracefully and return, instead of uvicorn's default of re-raising the signal after
-        # shutdown, which would skip the cleanup below and in the caller.
-        loop.add_signal_handler(signum, lambda: setattr(server, "should_exit", True))
+    class _Server(uvicorn.Server):
+        def handle_exit(self, sig, frame):
+            # Stop gracefully and return. uvicorn's default records the signal and re-raises it
+            # after shutdown, which would kill the process before the cleanup below and in the
+            # caller.
+            self.should_exit = True
+
+    config = uvicorn.Config(app, log_level="warning", lifespan="on", server_header=False)
+    server = _Server(config)
     try:
-        await server._serve()
+        await server.serve(sockets=[sock])
     finally:
         # The directory is private and we hold the only live listener on this path.
         try:
