@@ -119,9 +119,17 @@ def clipped(value, limit: int, *, display_text: bool = False):
 
 
 class Bridge:
-    def __init__(self, rpc: AppServer, ledger: Ledger, remote_root: str | None = None):
+    def __init__(
+        self,
+        rpc: AppServer,
+        ledger: Ledger,
+        remote_root: str | None = None,
+        mcp_transport: str = "stdio",
+    ):
         self.rpc = rpc
         self.ledger = ledger
+        # How MCP clients reach this bridge, e.g. "stdio" or "streamable-http on unix socket <path>".
+        self.mcp_transport = mcp_transport
         self._mutation_lock = asyncio.Lock()
         # Remote mode: the App Server runs on another host (reached through an ssh socket
         # forward). Local filesystem checks are skipped; paths must lie under remote_root.
@@ -184,11 +192,13 @@ class Bridge:
         await self.rpc.connect()
         return {
             "server": self.rpc.info,
-            "transport": (
-                "ssh-forwarded Unix WebSocket (remote mode)"
-                if self.remote
-                else "same-host Unix WebSocket"
-            ),
+            "transport": f"MCP over {self.mcp_transport}; App Server via "
+            f"{self.rpc.connection} {self.rpc.socket_path}",
+            "mcpTransport": self.mcp_transport,
+            "appServerConnection": {
+                "kind": self.rpc.connection,
+                "socket": str(self.rpc.socket_path),
+            },
             "socket": str(self.rpc.socket_path),
             "capabilities": {
                 "createThread": True,
@@ -200,11 +210,21 @@ class Bridge:
                 "desktopManagedWorktrees": False,
                 "bridgeManagedWorktrees": not self.remote,
                 "desktopProjectRegistry": False,
-                "clientSideToolsAndApprovals": ("declined and recorded" if self.remote else False),
+                "clientSideToolsAndApprovals": (
+                    "approvals declined and recorded; questions held for answer_request"
+                    if self.remote
+                    else False
+                ),
+                "answerRequest": self.remote,
                 "interruptTurn": True,
                 "turnResult": True,
             },
             "remoteRoot": self.remote_root,
+            "pendingRequests": {
+                "held": len(self.rpc.held),
+                "timeoutSeconds": self.rpc.request_timeout,
+                "note": "Held requests live in this process only; a bridge restart loses them.",
+            },
             "desktopVisibility": "Observed on Codex 0.153.4 with an existing project checkout; "
             "verify actual Desktop listing for each launch. Backend project IDs are separate.",
         }
@@ -988,7 +1008,15 @@ class Bridge:
         if cursor is not None:
             params["cursor"] = cursor
         page = await self.rpc.call("thread/turns/list", params)
-        return clipped({"thread": metadata["thread"], "turnsPage": page}, max_text_chars)
+        return clipped(
+            {
+                "thread": metadata["thread"],
+                "turnsPage": page,
+                "pendingRequests": self.rpc.pending_for(thread_id),
+                "declinedRequests": self.rpc.declined_for(thread_id),
+            },
+            max_text_chars,
+        )
 
     async def wait_thread(self, thread_id: str, turn_id: str, timeout_seconds=20):
         nonempty(thread_id, "thread_id", 128)
@@ -1016,30 +1044,125 @@ class Bridge:
                 async with asyncio.timeout(timeout_seconds):
                     while True:
                         latest = await inspect()
-                        if latest and latest.get("status") in {
-                            "completed",
-                            "failed",
-                            "interrupted",
-                        }:
+                        if latest and latest.get("status") in TERMINAL_STATUSES:
                             break
-                        await asyncio.sleep(0.5)
+                        # A held question blocks the turn: hand it to the caller right away.
+                        if self.rpc.pending_for(thread_id, turn_id):
+                            break
+                        await self.rpc.wait_held_change(0.5)
             except TimeoutError:
                 pass
-        terminal = latest is not None and latest.get("status") in {
-            "completed",
-            "failed",
-            "interrupted",
-        }
+        terminal = latest is not None and latest.get("status") in TERMINAL_STATUSES
+        pending = [] if terminal else self.rpc.pending_for(thread_id, turn_id)
         return clipped(
             {
                 "threadId": thread_id,
                 "turnId": turn_id,
-                "timedOut": not terminal,
+                "timedOut": not terminal and not pending,
+                "waitingForAnswer": bool(pending),
                 "turn": latest,
                 "observation": "found" if latest else "not observed in latest 100 turns",
+                "pendingRequests": pending,
+                **(
+                    {
+                        "note": "The turn is blocked on pendingRequests. Answer each with "
+                        "answer_request (or escalate the question to the user); unanswered "
+                        "requests are auto-declined at their deadline."
+                    }
+                    if pending
+                    else {}
+                ),
             },
             4000,
         )
+
+    # --- held question-type requests (references/upstream-sync.md, patch 4) ----------------------
+
+    async def answer_request(self, request_id: str, answers=None, decline: bool = False):
+        """Answer or decline one held requestUserInput / MCP elicitation request."""
+        nonempty(request_id, "request_id", 128)
+        entry = self.rpc.held.get(request_id)
+        if entry is None:
+            raise ValueError(
+                f"No pending request {request_id!r}: it was already answered, timed out "
+                "(see declinedRequests in get_turn_result / read_thread), was resolved by the "
+                "App Server, or the bridge restarted. Held requests are not persisted."
+            )
+        if decline and answers is not None:
+            raise ValueError("Pass either answers or decline=true, not both")
+        if not decline and answers is None:
+            raise ValueError("Pass answers (or decline=true) to settle the request")
+        result = self._response_for(entry, answers, decline)
+        await self.rpc.answer(request_id, result)
+        return {
+            "requestId": request_id,
+            "type": entry["type"],
+            "threadId": entry["threadId"],
+            "turnId": entry["turnId"],
+            "sent": "decline" if decline else "answers",
+            "note": "Sent to the App Server. Use wait_thread / get_turn_result to follow the turn.",
+        }
+
+    @staticmethod
+    def _response_for(entry, answers, decline):
+        """Build the protocol response for a held request, validating `answers` by request type."""
+        params = entry["params"]
+        if entry["type"] == "userInput":
+            if decline:
+                return {"answers": {}}
+            if not isinstance(answers, dict) or not answers:
+                raise ValueError(
+                    "answers must map each question id to a string or a list of strings"
+                )
+            questions = [q for q in params.get("questions") or [] if isinstance(q, dict)]
+            known = {q.get("id") for q in questions}
+            unknown = sorted(set(answers) - known)
+            if unknown:
+                raise ValueError(f"Unknown question id(s) {unknown}; expected {sorted(known)}")
+            missing = sorted(known - set(answers))
+            if missing:
+                raise ValueError(f"Missing answer(s) for question id(s) {missing}")
+            normalized = {}
+            for question_id, value in answers.items():
+                values = [value] if isinstance(value, str) else value
+                if (
+                    not isinstance(values, list)
+                    or not values
+                    or any(not isinstance(v, str) or not v.strip() for v in values)
+                ):
+                    raise ValueError(
+                        f"Answer for {question_id!r} must be a non-empty string or list of "
+                        "non-empty strings"
+                    )
+                normalized[question_id] = {"answers": values}
+            return {"answers": normalized}
+        # mcpServer/elicitation/request
+        mode = params.get("mode")
+        if decline:
+            return {"action": "decline"}
+        if mode == "openai/userVerification":
+            raise ValueError(
+                "This is a device-authenticated verification; the bridge cannot produce the "
+                "proof. Use decline=true or have the user approve it in a Codex client."
+            )
+        if not isinstance(answers, dict):
+            raise ValueError("answers must be an object (the elicitation content)")
+        if mode == "url":
+            if answers:
+                raise ValueError("A url-mode elicitation takes answers={} (accept) or decline=true")
+            return {"action": "accept"}
+        schema = params.get("requestedSchema")
+        if isinstance(schema, dict) and isinstance(schema.get("properties"), dict):
+            unknown = sorted(set(answers) - set(schema["properties"]))
+            if unknown:
+                raise ValueError(
+                    f"Unknown field(s) {unknown}; expected {sorted(schema['properties'])}"
+                )
+            required = schema.get("required") if isinstance(schema.get("required"), list) else []
+            missing = sorted(set(required) - set(answers))
+            if missing:
+                raise ValueError(f"Missing required field(s) {missing}")
+        return {"action": "accept", "content": answers}
 
     # --- charm-codex additions (references/upstream-sync.md, patch 3) ---------------------------
 
@@ -1081,6 +1204,7 @@ class Bridge:
         await self._remote_thread(thread_id)
         turn = await self._find_turn(thread_id, turn_id)
         declined = self.rpc.declined_for(thread_id, turn_id)
+        pending = self.rpc.pending_for(thread_id, turn_id)
         if turn is None:
             return {
                 "threadId": thread_id,
@@ -1088,6 +1212,7 @@ class Bridge:
                 "found": False,
                 "observation": "not found in the newest 500 turns",
                 "declinedRequests": declined,
+                "pendingRequests": pending,
             }
         items = [item for item in turn.get("items") or [] if isinstance(item, dict)]
 
@@ -1142,6 +1267,14 @@ class Bridge:
             "fileChanges": file_changes,
             "commands": commands,
             "declinedRequests": declined,
+            "pendingRequests": pending,
             "note": "fileChange diffs are the inner agent's account; verify the real working "
-            "tree diff independently.",
+            "tree diff independently."
+            + (
+                " declinedRequests lists approvals/questions the bridge refused (category "
+                "approval = never allowed, question = timed out or turn ended unanswered)."
+                if declined
+                else ""
+            )
+            + (" pendingRequests are waiting for answer_request." if pending else ""),
         }

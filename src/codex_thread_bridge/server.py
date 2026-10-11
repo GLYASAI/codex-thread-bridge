@@ -13,7 +13,7 @@ from mcp.types import ToolAnnotations
 from . import __version__
 from .bridge import Bridge
 from .ledger import open_endpoint_ledger
-from .rpc import AppServer
+from .rpc import DEFAULT_REQUEST_TIMEOUT, AppServer
 
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True)
@@ -225,8 +225,31 @@ def make_server(bridge: Bridge, *, http: bool = False):
         Zero returns one snapshot. A timeout leaves the turn running. Only the latest 100 turns
         are inspected; use read_thread pagination for older turns. Completion can mean failure
         or interruption: inspect turn.status. The response never substitutes another turn.
+        Returns early with waitingForAnswer=true when the turn is blocked on a question held in
+        pendingRequests (requestUserInput / MCP elicitation, remote mode); settle each with
+        answer_request before its deadline or it is auto-declined.
         """
         return await bridge.wait_thread(thread_id, turn_id, timeout_seconds)
+
+    @mcp.tool(annotations=WRITE)
+    async def answer_request(
+        request_id: str,
+        answers: dict[str, Any] | None = None,
+        decline: bool = False,
+    ) -> dict[str, Any]:
+        """Answer or decline one question held in pendingRequests (remote mode).
+
+        request_id is the pendingRequests[].requestId from wait_thread / read_thread /
+        get_turn_result. Exactly one of answers or decline=true.
+        type userInput: answers maps EVERY question id to a string or list of strings, e.g.
+        {"q1": "yes"}; decline=true sends no answers. type elicitation: answers is the form
+        content (keys within requestedSchema.properties, required keys present); for mode url use
+        answers={} to accept; mode openai/userVerification can only be declined. Approvals are
+        never held: they are declined automatically. Get the user's decision when the question
+        is theirs to make. An expired request_id (timed out, turn ended, bridge restarted) is
+        an error.
+        """
+        return await bridge.answer_request(request_id, answers, decline)
 
     @mcp.tool(annotations=WRITE)
     async def interrupt_turn(thread_id: str, turn_id: str) -> dict[str, Any]:
@@ -257,6 +280,9 @@ def make_server(bridge: Bridge, *, http: bool = False):
     async def get_operation(request_id: str) -> dict[str, Any]:
         """Read a mutation receipt, including known IDs after partial or uncertain delivery."""
         return bridge.ledger.get(request_id)
+
+    if not bridge.remote:
+        mcp.remove_tool("answer_request")  # questions are only held in remote mode
 
     if bridge.remote:
         # Remote mode swaps the local worktree tool for command/exec based ones. They run only
@@ -340,6 +366,15 @@ def main():
         "requests; manage worktrees under <root>/.worktrees through the App Server's command/exec.",
     )
     parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=DEFAULT_REQUEST_TIMEOUT,
+        metavar="SECONDS",
+        help="Remote mode: how long a requestUserInput / MCP elicitation request waits for "
+        "answer_request before it is auto-declined and recorded (default 600; 0 = decline at "
+        "once). Held requests are in memory only and are lost when the bridge restarts.",
+    )
+    parser.add_argument(
         "--endpoint-id",
         help="Stable name keying the operation ledger instead of the socket path (remote mode)",
     )
@@ -356,6 +391,8 @@ def main():
         "existing 700 directory; a stale socket is replaced, symlinks are refused)",
     )
     args = parser.parse_args()
+    if args.request_timeout < 0:
+        parser.error("--request-timeout must be >= 0")
     http = args.mcp_transport == "streamable-http"
     if http and args.mcp_socket is None:
         parser.error("--mcp-transport streamable-http requires --mcp-socket")
@@ -373,9 +410,11 @@ def main():
             declined_log=args.state_dir.expanduser() / "declined-requests.jsonl"
             if remote
             else None,
+            request_timeout=args.request_timeout,
         ),
         ledger,
         remote_root=args.remote_root,
+        mcp_transport=(f"streamable-http on unix socket {args.mcp_socket}" if http else "stdio"),
     )
     if not http:
         make_server(bridge).run(transport="stdio")

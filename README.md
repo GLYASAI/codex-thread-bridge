@@ -140,9 +140,25 @@ reached through an `ssh -L <local.sock>:<remote.sock>` forward (`--socket <local
   POSIX paths equal to or under the remote root (no `..`, `.`, `//`, trailing `/`);
 - only `read-only` / `workspace-write` sandboxes and `approvalPolicy: never`; threads outside the
   root, or resumed with another sandbox, are not driven;
-- server requests (approvals, user input, elicitation) are answered with a decline, unknown
-  ones with JSON-RPC `-32601`, so a turn never waits forever; each is recorded in memory and in
-  `<state-dir>/declined-requests.jsonl` and shown by `get_turn_result`;
+- approval-type server requests (command, file change, permissions, legacy exec/patch approvals)
+  are declined at once; unknown ones get JSON-RPC `-32601`; so a turn never waits forever. Each is
+  recorded in memory and in `<state-dir>/declined-requests.jsonl` (with a `category`: `approval`,
+  `question` or `unsupported`) and listed as `declinedRequests` by `get_turn_result` and
+  `read_thread`;
+- question-type requests (`item/tool/requestUserInput`, `mcpServer/elicitation/request`) are
+  **held**, not answered. They live in the bridge process, shared by all MCP sessions, and are
+  listed as `pendingRequests` (`requestId`, `type` `userInput`|`elicitation`, thread/turn, the
+  question payload, `deadlineAt`, `secondsRemaining`) by `wait_thread`, `read_thread` and
+  `get_turn_result`. A `wait_thread` that is blocked returns as soon as a request becomes pending
+  (`waitingForAnswer: true`; it also returns immediately if one is already pending).
+  `answer_request(request_id, answers=None, decline=False)` settles one: for `userInput`,
+  `answers` maps every question id to a string or list of strings; for `elicitation`, `answers` is
+  the form content checked against `requestedSchema` (`{}` accepts a `url` elicitation;
+  `openai/userVerification` can only be declined). On `--request-timeout SECONDS` (default 600; 0
+  declines at once) the request is auto-declined and recorded. Held requests are dropped (and
+  recorded) when the App Server resolves them, their turn completes, or the App Server connection
+  drops. They are not persisted: **restarting the bridge loses them** and the App Server then
+  handles the turn on its own;
 - worktrees are managed on the App Server host through `command/exec` (fixed `git worktree`
   argv, never a shell string, sandbox `workspaceWrite` limited to `<root>/.git` and
   `<root>/.worktrees`, timeout enforced by the server). `create_worktree_thread(request_id, name,
@@ -155,6 +171,10 @@ reached through an `ssh -L <local.sock>:<remote.sock>` forward (`--socket <local
   fresh connection if the connection drops (relays may close idle connections), so `wait_thread`
   survives it; mutations are never resent;
 - `--endpoint-id NAME` keys the operation ledger by name instead of by socket path.
+
+`get_capabilities` reports the real transports: `mcpTransport` (`stdio` or `streamable-http on
+unix socket <path>`) and `appServerConnection` (unix WebSocket control socket, or the codex CLI
+proxy).
 
 New tools (all modes): `interrupt_turn(thread_id, turn_id)` and
 `get_turn_result(thread_id, turn_id, max_text_chars=20000)` (final agent message, `fileChange`

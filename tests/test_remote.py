@@ -233,8 +233,11 @@ async def test_get_turn_result_truncates_large_text(remote):
         ("item/fileChange/requestApproval", {"reason": "write"}, {"decision": "decline"}),
         ("execCommandApproval", {"command": ["ls"]}, {"decision": "denied"}),
         ("applyPatchApproval", {}, {"decision": "denied"}),
-        ("item/tool/requestUserInput", {"questions": []}, {"answers": {}}),
-        ("mcpServer/elicitation/request", {"serverName": "s"}, {"action": "decline"}),
+        (
+            "item/permissions/requestApproval",
+            {"permissions": {}, "reason": "net"},
+            {"permissions": {}, "scope": "turn"},
+        ),
     ],
 )
 async def test_server_requests_are_declined_and_turn_finishes(remote, method, params, expected):
@@ -247,6 +250,9 @@ async def test_server_requests_are_declined_and_turn_finishes(remote, method, pa
     result = await bridge.get_turn_result(created["threadId"], created["turnId"])
     (record,) = result["declinedRequests"]
     assert record["method"] == method and record["turnId"] == created["turnId"]
+    assert record["category"] == "approval"
+    assert result["pendingRequests"] == []
+    assert "declinedRequests lists approvals" in result["note"]
 
 
 async def test_unknown_server_request_gets_method_not_found(remote):
@@ -287,7 +293,12 @@ async def test_capabilities_report_remote_mode(remote):
     caps = await bridge.capabilities()
     assert caps["remoteRoot"] == ROOT
     assert caps["capabilities"]["bridgeManagedWorktrees"] is False
-    assert caps["capabilities"]["clientSideToolsAndApprovals"] == "declined and recorded"
+    assert "approvals declined and recorded" in caps["capabilities"]["clientSideToolsAndApprovals"]
+    # transport text reports the real MCP transport and App Server connection
+    assert caps["mcpTransport"] == "stdio"
+    assert caps["appServerConnection"]["kind"] == "unix WebSocket control socket"
+    assert caps["transport"].startswith("MCP over stdio; App Server via unix WebSocket")
+    assert "ssh" not in caps["transport"]
     assert caps["server"]["userAgent"]
 
 

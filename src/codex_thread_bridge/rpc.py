@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -16,16 +17,24 @@ from . import __version__
 from .proxy_transport import ProxyWebSocket
 
 # Remote mode (references: README "Remote mode"): server requests are answered instead of ignored,
-# so a turn can never wait forever on an approval or user-input prompt nobody will answer.
-# Anything not listed gets a JSON-RPC -32601 error, which also unblocks the turn.
+# so a turn can never wait forever on a prompt nobody will answer.
+# Approval-type requests are always declined at once. Question-type requests (HELD_METHODS) are held
+# for answer_request until request_timeout, then declined. Anything not listed gets a JSON-RPC
+# -32601 error, which also unblocks the turn.
 DECLINE_RESULTS: dict[str, dict] = {
     "item/commandExecution/requestApproval": {"decision": "decline"},
     "item/fileChange/requestApproval": {"decision": "decline"},
+    "item/permissions/requestApproval": {"permissions": {}, "scope": "turn"},
     "execCommandApproval": {"decision": "denied"},
     "applyPatchApproval": {"decision": "denied"},
     "item/tool/requestUserInput": {"answers": {}},
     "mcpServer/elicitation/request": {"action": "decline"},
 }
+HELD_METHODS = {
+    "item/tool/requestUserInput": "userInput",
+    "mcpServer/elicitation/request": "elicitation",
+}
+DEFAULT_REQUEST_TIMEOUT = 600.0
 READ_ONLY_METHODS = frozenset(
     {"thread/read", "thread/list", "thread/turns/list", "thread/goal/get", "project/read"}
 )
@@ -54,6 +63,7 @@ class AppServer:
         decline_server_requests: bool = False,
         retry_reads: bool = False,
         declined_log: Path | None = None,
+        request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
     ):
         self.socket_path = socket_path
         self.timeout = timeout
@@ -71,19 +81,148 @@ class AppServer:
         self.retry_reads = retry_reads
         self.declined_log = declined_log
         self.declined: collections.deque = collections.deque(maxlen=DECLINED_MEMORY)
+        # Held question-type requests, shared by every MCP session (one process, one event loop).
+        # Lost when the bridge restarts or the App Server connection drops.
+        self.request_timeout = request_timeout
+        self.held: dict[str, dict[str, Any]] = {}
+        self._held_changed: asyncio.Event | None = None
+
+    @property
+    def connection(self) -> str:
+        """How this bridge reaches the App Server."""
+        proxy = self.transport == "proxy" or (self.transport == "auto" and sys.platform == "win32")
+        return "codex CLI proxy" if proxy else "unix WebSocket control socket"
+
+    # --- held question-type requests -----------------------------------------------------------
+
+    def _notify_held(self):
+        if self._held_changed is not None:
+            self._held_changed.set()
+            self._held_changed = None
+
+    async def wait_held_change(self, timeout: float):
+        """Return when a request is held or released, or after `timeout` seconds."""
+        if self._held_changed is None:
+            self._held_changed = asyncio.Event()
+        event = self._held_changed
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(event.wait(), timeout)
+
+    def _hold(self, message: dict[str, Any], ws):
+        params = message.get("params")
+        params = params if isinstance(params, dict) else {}
+        request_id = "rq-" + uuid.uuid4().hex[:12]
+        now = time.time()
+        entry = {
+            "requestId": request_id,
+            "type": HELD_METHODS[message["method"]],
+            "method": message["method"],
+            "threadId": params.get("threadId"),
+            "turnId": params.get("turnId"),
+            "itemId": params.get("itemId"),
+            "createdAt": round(now, 3),
+            "deadlineAt": round(now + self.request_timeout, 3),
+            "params": params,
+            "_rpc_id": message["id"],
+            "_message": message,
+            "_ws": ws,
+        }
+        entry["_timer"] = asyncio.get_running_loop().call_later(
+            self.request_timeout, lambda: asyncio.ensure_future(self._expire(request_id))
+        )
+        self.held[request_id] = entry
+        self._notify_held()
+
+    def _release(self, request_id: str):
+        entry = self.held.pop(request_id, None)
+        if entry is not None:
+            entry["_timer"].cancel()
+            self._notify_held()
+        return entry
+
+    async def _expire(self, request_id: str):
+        entry = self._release(request_id)
+        if entry is None:
+            return
+        self._record_decline(
+            entry["_message"], f"timed out after {self.request_timeout:g}s; auto-declined"
+        )
+        with contextlib.suppress(Exception):
+            await entry["_ws"].send(
+                json.dumps({"id": entry["_rpc_id"], "result": DECLINE_RESULTS[entry["method"]]})
+            )
+
+    def _drop_held(self, reason: str, thread_id=None, turn_id=None, rpc_id=None, ws=None):
+        """Forget held requests the App Server no longer waits on; keep a record of them."""
+        for request_id, entry in list(self.held.items()):
+            if thread_id is not None and entry["threadId"] != thread_id:
+                continue
+            if turn_id is not None and entry["turnId"] not in (None, turn_id):
+                continue
+            if rpc_id is not None and entry["_rpc_id"] != rpc_id:
+                continue
+            if ws is not None and entry["_ws"] is not ws:
+                continue
+            self._release(request_id)
+            self._record_decline(entry["_message"], reason)
+
+    def pending_for(self, thread_id: str | None = None, turn_id: str | None = None):
+        """Public view of held requests, oldest first, optionally for one thread / turn."""
+        now = time.time()
+        result = []
+        for entry in sorted(self.held.values(), key=lambda e: e["createdAt"]):
+            if thread_id is not None and entry["threadId"] != thread_id:
+                continue
+            if turn_id is not None and entry["turnId"] not in (None, turn_id):
+                continue
+            view = {k: v for k, v in entry.items() if not k.startswith("_") and k != "params"}
+            view["secondsRemaining"] = max(0, round(entry["deadlineAt"] - now, 1))
+            view["request"] = {
+                k: v for k, v in entry["params"].items() if k not in {"threadId", "turnId"}
+            }
+            result.append(view)
+        return result
+
+    async def answer(self, request_id: str, result: dict[str, Any]):
+        """Send `result` for a held request. The caller has already validated it."""
+        entry = self._release(request_id)
+        if entry is None:
+            raise KeyError(request_id)
+        try:
+            await entry["_ws"].send(json.dumps({"id": entry["_rpc_id"], "result": result}))
+        except Exception as error:
+            raise TransportError(
+                "App Server connection lost before the answer was sent; "
+                "the request is gone (the turn is handled by the App Server)"
+            ) from error
 
     def _record_decline(self, message: dict[str, Any], answer: str):
         params = message.get("params")
         params = params if isinstance(params, dict) else {}
+        questions = params.get("questions")
+        first_question = (
+            questions[0].get("question")
+            if isinstance(questions, list) and questions and isinstance(questions[0], dict)
+            else None
+        )
         detail = (
             params.get("command")
             or params.get("reason")
+            or first_question
             or params.get("message")
             or params.get("serverName")
             or ""
         )
+        method = message.get("method")
         record = {
-            "method": message.get("method"),
+            "method": method,
+            "category": (
+                "question"
+                if method in HELD_METHODS
+                else "unsupported"
+                if method not in DECLINE_RESULTS
+                else "approval"
+            ),
             "threadId": params.get("threadId") or params.get("conversationId"),
             "turnId": params.get("turnId"),
             "detail": str(detail)[:300],
@@ -123,6 +262,9 @@ class AppServer:
 
     async def _answer_server_request(self, ws, message: dict[str, Any]):
         method = message.get("method")
+        if method in HELD_METHODS and self.request_timeout > 0:
+            self._hold(message, ws)
+            return
         if method in DECLINE_RESULTS:
             reply = {"id": message["id"], "result": DECLINE_RESULTS[method]}
             self._record_decline(message, "declined")
@@ -184,6 +326,8 @@ class AppServer:
             async for raw in ws:
                 message = json.loads(raw)
                 if "method" in message:
+                    if self.decline_server_requests and "id" not in message:
+                        self._observe_notification(message)
                     if self.decline_server_requests and "id" in message:
                         await self._answer_server_request(ws, message)
                         continue
@@ -201,9 +345,27 @@ class AppServer:
         except Exception as error:
             failure = f"App Server transport failed: {type(error).__name__}: {error}"
         finally:
+            self._drop_held("lost: App Server connection ended; request is gone", ws=ws)
             for future in list(self._pending.values()):
                 if not future.done():
                     future.set_exception(TransportError(failure))
+
+    def _observe_notification(self, message: dict[str, Any]):
+        """Clean up held requests when the App Server resolves them or their turn ends."""
+        method, params = message.get("method"), message.get("params")
+        params = params if isinstance(params, dict) else {}
+        if method == "serverRequest/resolved":
+            self._drop_held(
+                "resolved by the App Server before an answer",
+                params.get("threadId"),
+                rpc_id=params.get("requestId"),
+            )
+        elif method == "turn/completed":
+            turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+            if params.get("threadId") and turn.get("id"):
+                self._drop_held(
+                    "turn ended before an answer", params["threadId"], turn_id=turn["id"]
+                )
 
     async def _request(
         self, method: str, params: dict[str, Any] | None, timeout: float | None = None
@@ -230,9 +392,7 @@ class AppServer:
             raise TransportError(f"{method}: invalid response; outcome unknown")
         return message["result"]
 
-    async def call(
-        self, method: str, params: dict[str, Any] | None, timeout: float | None = None
-    ):
+    async def call(self, method: str, params: dict[str, Any] | None, timeout: float | None = None):
         await self.connect()
         # Reconnect before a new request, never retry an already-sent mutation.
         try:
