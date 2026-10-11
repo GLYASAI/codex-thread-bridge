@@ -355,24 +355,12 @@ def main():
         help="streamable-http: absolute unix socket path to listen on (created 600 in an "
         "existing 700 directory; a stale socket is replaced, symlinks are refused)",
     )
-    parser.add_argument(
-        "--mcp-token-file",
-        type=Path,
-        help="streamable-http: file holding the Bearer token (mode 600, owned by this user)",
-    )
     args = parser.parse_args()
     http = args.mcp_transport == "streamable-http"
-    if http and (args.mcp_socket is None or args.mcp_token_file is None):
-        parser.error("--mcp-transport streamable-http requires --mcp-socket and --mcp-token-file")
-    if not http and (args.mcp_socket is not None or args.mcp_token_file is not None):
-        parser.error("--mcp-socket and --mcp-token-file require --mcp-transport streamable-http")
-    if http:
-        from .http_transport import TransportConfigError, read_token_file
-
-        try:
-            token = read_token_file(args.mcp_token_file)
-        except TransportConfigError as error:
-            parser.exit(2, f"{parser.prog}: error: {error}\n")
+    if http and args.mcp_socket is None:
+        parser.error("--mcp-transport streamable-http requires --mcp-socket")
+    if not http and args.mcp_socket is not None:
+        parser.error("--mcp-socket requires --mcp-transport streamable-http")
     socket_path, ledger = open_endpoint_ledger(args.socket, args.state_dir, args.endpoint_id)
     remote = args.remote_root is not None
     bridge = Bridge(
@@ -403,7 +391,7 @@ def main():
 
     async def serve_http():
         try:
-            await serve(build_app(make_server(bridge, http=True), token), listener, args.mcp_socket)
+            await serve(build_app(make_server(bridge, http=True)), listener, args.mcp_socket)
         finally:
             await close_bridge(bridge)
 

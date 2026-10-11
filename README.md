@@ -167,13 +167,13 @@ an ssh socket forward:
 
 ```
 codex-thread-bridge --mcp-transport streamable-http \
-  --mcp-socket /path/dir700/bridge.sock --mcp-token-file /path/token600 [--remote-root /code ...]
+  --mcp-socket /path/dir700/bridge.sock [--remote-root /code ...]
 ```
 
 - The socket is created mode 600 in an existing, user-owned 700 directory; a symlink or non-socket
   at the path is refused; only a stale socket (no listener) is replaced; a live one is an error.
-- The token file must be a regular, non-symlink file owned by the user with mode 600 (at least 16
-  printable ASCII characters). Every request needs `Authorization: Bearer <token>`; otherwise 401.
+- There is no application-level authentication: the socket (600, same-UID, in a 700 directory) is the
+  access control. Do not expose it beyond a trusted tunnel.
 - The endpoint is `/mcp`. The server is stateless: each request is its own MCP session and all
   share one bridge (one App Server connection, one ledger), so concurrent clients see the same
   threads and a client reconnecting after a bridge restart needs no session recovery.

@@ -15,13 +15,8 @@ import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from codex_thread_bridge.http_transport import (
-    TransportConfigError,
-    bind_private_socket,
-    read_token_file,
-)
+from codex_thread_bridge.http_transport import TransportConfigError, bind_private_socket
 
-TOKEN = "t0ken-" + "x" * 32
 INIT = {
     "jsonrpc": "2.0",
     "id": 1,
@@ -44,38 +39,7 @@ def private_dir():
         shutil.rmtree(path, ignore_errors=True)
 
 
-def write_token(directory: Path, text: str = TOKEN, mode: int = 0o600) -> Path:
-    path = directory / "token"
-    path.write_text(text + "\n")
-    path.chmod(mode)
-    return path
-
-
-# --- token file and socket checks ---------------------------------------------------------------
-
-
-def test_token_file_ok(private_dir):
-    assert read_token_file(write_token(private_dir)) == TOKEN.encode()
-
-
-@pytest.mark.parametrize("mode", [0o644, 0o640, 0o400, 0o700])
-def test_token_file_requires_mode_600(private_dir, mode):
-    with pytest.raises(TransportConfigError, match="mode 600"):
-        read_token_file(write_token(private_dir, mode=mode))
-
-
-def test_token_file_rejects_symlink_missing_short_and_spaces(private_dir):
-    real = write_token(private_dir)
-    link = private_dir / "link"
-    link.symlink_to(real)
-    with pytest.raises(TransportConfigError):
-        read_token_file(link)
-    with pytest.raises(TransportConfigError):
-        read_token_file(private_dir / "missing")
-    with pytest.raises(TransportConfigError, match="at least"):
-        read_token_file(write_token(private_dir, "short"))
-    with pytest.raises(TransportConfigError, match="printable"):
-        read_token_file(write_token(private_dir, "a" * 20 + " " + "b" * 20))
+# --- socket checks ----------------------------------------------------------------------------
 
 
 def test_socket_is_created_600_in_700_dir(private_dir):
@@ -135,7 +99,6 @@ def test_socket_replaces_stale_but_not_live(private_dir):
 @pytest.fixture
 async def http_bridge(fake_server, private_dir):
     _, app_socket = fake_server
-    token_file = write_token(private_dir)
     mcp_socket = private_dir / "bridge.sock"
     process = subprocess.Popen(
         [
@@ -150,8 +113,6 @@ async def http_bridge(fake_server, private_dir):
             "streamable-http",
             "--mcp-socket",
             str(mcp_socket),
-            "--mcp-token-file",
-            str(token_file),
         ],
         stderr=subprocess.PIPE,
     )
@@ -172,36 +133,22 @@ async def http_bridge(fake_server, private_dir):
             process.stderr.close()
 
 
-def client(mcp_socket: Path, token: str | None = TOKEN) -> httpx.AsyncClient:
-    headers = {"authorization": f"Bearer {token}"} if token is not None else {}
+def client(mcp_socket: Path) -> httpx.AsyncClient:
     return httpx.AsyncClient(
-        transport=httpx.AsyncHTTPTransport(uds=str(mcp_socket)),
-        headers=headers,
-        timeout=30,
+        transport=httpx.AsyncHTTPTransport(uds=str(mcp_socket)), timeout=30
     )
 
 
 URL = "http://127.0.0.1:8000/mcp"
 
 
-async def test_http_requires_bearer_token(http_bridge):
+async def test_http_initialize_over_private_socket(http_bridge):
     mcp_socket, _ = http_bridge
     assert stat.S_IMODE(mcp_socket.lstat().st_mode) == 0o600
-    for token in (None, "wrong-" + "y" * 32, TOKEN[:-1], TOKEN + "x"):
-        async with client(mcp_socket, token) as http:
-            response = await http.post(URL, json=INIT, headers=MCP_HEADERS)
-            assert response.status_code == 401, token
-            assert "bearer" in response.headers["www-authenticate"].lower()
-            assert TOKEN not in response.text
     async with client(mcp_socket) as http:
-        # a non-Bearer scheme with the right secret is rejected too
-        response = await http.post(
-            URL, json=INIT, headers={**MCP_HEADERS, "authorization": f"Basic {TOKEN}"}
-        )
-        assert response.status_code == 401
-        ok = await http.post(URL, json=INIT, headers=MCP_HEADERS)
-        assert ok.status_code == 200
-        assert ok.json()["result"]["serverInfo"]["name"] == "codex-thread-bridge"
+        response = await http.post(URL, json=INIT, headers=MCP_HEADERS)
+        assert response.status_code == 200
+        assert response.json()["result"]["serverInfo"]["name"] == "codex-thread-bridge"
 
 
 async def test_http_sessions_share_one_bridge(http_bridge, fake_server):
@@ -266,16 +213,16 @@ def test_http_flags_are_validated(private_dir):
     result = run_cli("--mcp-transport", "streamable-http")
     assert result.returncode == 2 and "requires --mcp-socket" in result.stderr
     result = run_cli("--mcp-socket", str(private_dir / "x.sock"))
-    assert result.returncode == 2 and "require --mcp-transport" in result.stderr
-    bad = write_token(private_dir, mode=0o644)
+    assert result.returncode == 2 and "requires --mcp-transport" in result.stderr
+    private_dir.chmod(0o755)
     result = run_cli(
-        "--mcp-transport",
-        "streamable-http",
-        "--mcp-socket",
-        str(private_dir / "x.sock"),
-        "--mcp-token-file",
-        str(bad),
+        "--mcp-transport", "streamable-http", "--mcp-socket", str(private_dir / "x.sock")
     )
-    assert result.returncode == 2 and "mode 600" in result.stderr
-    assert TOKEN not in result.stderr
+    assert result.returncode == 2 and "mode 700" in result.stderr
     assert not (private_dir / "x.sock").exists()
+
+
+def test_stdio_remains_the_default():
+    result = run_cli("--help")
+    assert "--mcp-transport {stdio,streamable-http}" in result.stdout
+    assert "(default stdio)" in result.stdout

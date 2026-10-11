@@ -1,54 +1,22 @@
-"""Streamable-HTTP MCP transport on a private unix socket, guarded by a Bearer token.
+"""Streamable-HTTP MCP transport on a private unix socket.
 
 Intended for running the bridge next to the App Server and reaching it through an ssh socket
-forward. The socket lives in a user-owned 700 directory and is created 600; every request must
-carry `Authorization: Bearer <token>` (constant-time comparison, 401 otherwise). The default MCP
+forward. There is no application-level authentication: access control is the socket itself, which
+lives in a user-owned 700 directory and is created 600 (same-UID peers only). The default MCP
 transport stays stdio; nothing here is imported unless --mcp-transport streamable-http is used.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hmac
 import os
 import signal
 import socket
 import stat
 from pathlib import Path
 
-MAX_TOKEN_BYTES = 4096
-MIN_TOKEN_CHARS = 16
-
-
 class TransportConfigError(Exception):
-    """The socket or token file does not meet the safety requirements."""
-
-
-def read_token_file(path: Path) -> bytes:
-    """Read a Bearer token; the file must be a user-owned regular file with mode 600."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
-    except OSError as exc:
-        raise TransportConfigError(f"cannot open token file {path}: {exc.strerror}") from exc
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise TransportConfigError(f"token file {path} must be a regular file")
-        if info.st_uid != os.geteuid():
-            raise TransportConfigError(f"token file {path} must be owned by the current user")
-        if stat.S_IMODE(info.st_mode) != 0o600:
-            raise TransportConfigError(f"token file {path} must have mode 600")
-        if info.st_size > MAX_TOKEN_BYTES:
-            raise TransportConfigError(f"token file {path} is too large")
-        data = os.read(fd, MAX_TOKEN_BYTES + 1)
-    finally:
-        os.close(fd)
-    token = data.strip()
-    if len(token) < MIN_TOKEN_CHARS:
-        raise TransportConfigError(f"token in {path} must be at least {MIN_TOKEN_CHARS} characters")
-    if any(b <= 0x20 or b >= 0x7F for b in token):
-        raise TransportConfigError(f"token in {path} must be printable ASCII without spaces")
-    return token
+    """The socket path does not meet the safety requirements."""
 
 
 def _is_live(path: str) -> bool:
@@ -111,49 +79,9 @@ def bind_private_socket(path: Path) -> socket.socket:
     return sock
 
 
-class BearerAuth:
-    """Pure ASGI middleware: 401 unless `Authorization: Bearer <token>` matches."""
-
-    def __init__(self, app, token: bytes):
-        self.app = app
-        self.token = token
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "lifespan":
-            await self.app(scope, receive, send)
-            return
-        if scope["type"] != "http":
-            if scope["type"] == "websocket":
-                await send({"type": "websocket.close", "code": 1008})
-            return
-        supplied = b""
-        for name, value in scope.get("headers", ()):
-            if name == b"authorization":
-                scheme, _, rest = value.partition(b" ")
-                if scheme.lower() == b"bearer":
-                    supplied = rest.strip()
-                break
-        if not hmac.compare_digest(supplied, self.token):
-            body = b'{"error":"unauthorized"}'
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 401,
-                    "headers": [
-                        (b"content-type", b"application/json"),
-                        (b"content-length", str(len(body)).encode()),
-                        (b"www-authenticate", b'Bearer realm="codex-thread-bridge"'),
-                    ],
-                }
-            )
-            await send({"type": "http.response.body", "body": body})
-            return
-        await self.app(scope, receive, send)
-
-
-def build_app(mcp, token: bytes):
-    """The FastMCP streamable-HTTP app (/mcp) wrapped in Bearer auth."""
-    return BearerAuth(mcp.streamable_http_app(), token)
+def build_app(mcp):
+    """The FastMCP streamable-HTTP ASGI app (endpoint /mcp)."""
+    return mcp.streamable_http_app()
 
 
 async def serve(app, sock: socket.socket, socket_path: Path) -> None:
@@ -179,6 +107,6 @@ async def serve(app, sock: socket.socket, socket_path: Path) -> None:
         sock.close()
 
 
-def run(mcp, socket_path: Path, token: bytes) -> None:
+def run(mcp, socket_path: Path) -> None:
     sock = bind_private_socket(socket_path)
-    asyncio.run(serve(build_app(mcp, token), sock, socket_path))
+    asyncio.run(serve(build_app(mcp), sock, socket_path))
