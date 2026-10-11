@@ -159,3 +159,21 @@ reached through an `ssh -L <local.sock>:<remote.sock>` forward (`--socket <local
 New tools (all modes): `interrupt_turn(thread_id, turn_id)` and
 `get_turn_result(thread_id, turn_id, max_text_chars=20000)` (final agent message, `fileChange`
 diffs, command summary, declined requests). Tests: `uv run pytest` (see `tests/test_remote.py`).
+
+## Streamable HTTP on a unix socket (fork patch)
+
+Default MCP transport is still stdio. To run the bridge next to the App Server and reach it through
+an ssh socket forward:
+
+```
+codex-thread-bridge --mcp-transport streamable-http \
+  --mcp-socket /path/dir700/bridge.sock --mcp-token-file /path/token600 [--remote-root /code ...]
+```
+
+- The socket is created mode 600 in an existing, user-owned 700 directory; a symlink or non-socket
+  at the path is refused; only a stale socket (no listener) is replaced; a live one is an error.
+- The token file must be a regular, non-symlink file owned by the user with mode 600 (at least 16
+  printable ASCII characters). Every request needs `Authorization: Bearer <token>`; otherwise 401.
+- The endpoint is `/mcp`. The server is stateless: each request is its own MCP session and all
+  share one bridge (one App Server connection, one ledger), so concurrent clients see the same
+  threads and a client reconnecting after a bridge restart needs no session recovery.
