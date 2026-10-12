@@ -308,9 +308,11 @@ def make_server(bridge: Bridge, *, http: bool = False):
             ^[a-z0-9][a-z0-9._-]{0,63}$. base_ref is required (e.g. origin/dev; no fetch is done).
             With branch, creates that new branch (no upstream tracking); without, a detached
             checkout. The task then starts with that cwd, approval never, runtime workspace root
-            = the worktree. Reuse request_id after uncertainty (receipts replay). Failures return
-            git's exit code/stdout/stderr in the receipt (worktree.add); nothing is removed
-            automatically, use remove_worktree.
+            = the worktree. If the bridge runs with --worktree-setup, that executable is run on
+            the new worktree first (receipt worktree.setup) and a failure withholds the task.
+            Reuse request_id after uncertainty (receipts replay). Failures return git's exit
+            code/stdout/stderr in the receipt (worktree.add); nothing is removed automatically,
+            use remove_worktree.
             """
             return await bridge.create_remote_worktree_thread(
                 request_id, name, base_ref, sandbox, branch, prompt, title, model, reasoning_effort
@@ -366,6 +368,14 @@ def main():
         "requests; manage worktrees under <root>/.worktrees through the App Server's command/exec.",
     )
     parser.add_argument(
+        "--worktree-setup",
+        metavar="PATH",
+        help="Remote mode: absolute path of an executable on the App Server host. "
+        "create_worktree_thread runs [PATH, <worktree>] through command/exec (same minimal "
+        "sandbox as git worktree add) after checkout; a non-zero exit fails the operation "
+        "before the task starts.",
+    )
+    parser.add_argument(
         "--request-timeout",
         type=float,
         default=DEFAULT_REQUEST_TIMEOUT,
@@ -398,6 +408,8 @@ def main():
         parser.error("--mcp-transport streamable-http requires --mcp-socket")
     if not http and args.mcp_socket is not None:
         parser.error("--mcp-socket requires --mcp-transport streamable-http")
+    if args.worktree_setup is not None and args.remote_root is None:
+        parser.error("--worktree-setup requires --remote-root")
     socket_path, ledger = open_endpoint_ledger(args.socket, args.state_dir, args.endpoint_id)
     remote = args.remote_root is not None
     bridge = Bridge(
@@ -414,6 +426,7 @@ def main():
         ),
         ledger,
         remote_root=args.remote_root,
+        worktree_setup=args.worktree_setup,
         mcp_transport=(f"streamable-http on unix socket {args.mcp_socket}" if http else "stdio"),
     )
     if not http:

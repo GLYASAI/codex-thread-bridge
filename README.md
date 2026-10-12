@@ -167,6 +167,11 @@ reached through an `ssh -L <local.sock>:<remote.sock>` forward (`--socket <local
   required, no fetch; `branch` makes a new branch without upstream, otherwise `--detach`);
   `remove_worktree(name, force=false)` only removes registered worktrees directly under
   `.worktrees/`; `list_worktrees()` lists them. There is no generic command tool;
+- `--worktree-setup PATH` (remote mode, optional) names one executable on the App Server host
+  that `create_worktree_thread` runs as `[PATH, <worktree>]` after checkout, in the same sandbox
+  and before the task starts (for example, copying untracked agent context into the worktree).
+  Its output is in the receipt under `worktree.setup`; a non-zero exit fails the operation and
+  withholds the task;
 - read-only requests (`thread/read`, `thread/list`, `thread/turns/list`, ...) are retried once on a
   fresh connection if the connection drops (relays may close idle connections), so `wait_thread`
   survives it; mutations are never resent;

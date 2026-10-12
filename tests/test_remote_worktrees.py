@@ -185,6 +185,71 @@ async def test_create_replays_receipt_without_rerunning_git(remote):
     assert len(execs(fake)) == 2  # add + rev-parse only once
 
 
+SETUP = "/agent-context/scripts/sync-charm-context"
+
+
+@pytest.fixture
+async def remote_with_setup(fake_server, tmp_path):
+    fake, socket = fake_server
+    rpc = AppServer(socket, timeout=2, decline_server_requests=True, retry_reads=True)
+    ledger = Ledger(tmp_path / "state" / "operations.sqlite3")
+    try:
+        yield fake, Bridge(rpc, ledger, remote_root=ROOT, worktree_setup=SETUP)
+    finally:
+        await rpc.close()
+        ledger.close()
+
+
+async def test_create_runs_setup_after_checkout_before_thread(remote_with_setup):
+    fake, bridge = remote_with_setup
+    receipt = await bridge.create_remote_worktree_thread(
+        "s1", "ctx", "origin/dev", "workspace-write", prompt="go"
+    )
+    assert receipt["status"] == "accepted", receipt
+    add, head, setup = execs(fake)
+    assert setup["command"] == [SETUP, f"{WT}/ctx"]
+    assert setup["sandboxPolicy"] == rw.write_sandbox(ROOT)
+    assert receipt["worktree"]["setup"]["exitCode"] == 0
+    methods = [m for m, _ in fake.calls]
+    assert methods.index("thread/start") > max(
+        i for i, m in enumerate(methods) if m == "command/exec"
+    )
+
+
+async def test_setup_failure_withholds_task(remote_with_setup):
+    fake, bridge = remote_with_setup
+    fake.exec_fail["setup"] = (1, "sync-charm-context: refusing tracked Charm path(s)")
+    receipt = await bridge.create_remote_worktree_thread(
+        "s2", "ctx2", "origin/dev", "workspace-write", prompt="go"
+    )
+    assert receipt["status"] == "failed"
+    assert "worktree setup failed (exit 1)" in receipt["error"]
+    assert receipt["worktree"]["setup"]["stderr"].startswith("sync-charm-context")
+    assert receipt["worktree"]["state"] == "created"  # retained for inspection
+    assert fake.count("thread/start") == 0 and fake.count("turn/start") == 0
+
+
+async def test_without_setup_no_extra_exec(remote):
+    fake, bridge = remote
+    await bridge.create_remote_worktree_thread("s3", "plain", "origin/dev", "read-only")
+    assert len(execs(fake)) == 2
+
+
+@pytest.mark.parametrize(
+    "remote_root, setup", [(None, SETUP), (ROOT, "relative/setup"), (ROOT, "/a/../b")]
+)
+async def test_setup_path_validation(fake_server, tmp_path, remote_root, setup):
+    _, socket = fake_server
+    rpc = AppServer(socket, timeout=2)
+    ledger = Ledger(tmp_path / "state" / "operations.sqlite3")
+    try:
+        with pytest.raises(ValueError, match="worktree_setup"):
+            Bridge(rpc, ledger, remote_root=remote_root, worktree_setup=setup)
+    finally:
+        await rpc.close()
+        ledger.close()
+
+
 async def test_local_mode_has_no_remote_worktree_tools(bridge):
     with pytest.raises(ValueError, match="only in remote mode"):
         await bridge.create_remote_worktree_thread("x", "a", "origin/dev", "read-only")

@@ -125,6 +125,7 @@ class Bridge:
         ledger: Ledger,
         remote_root: str | None = None,
         mcp_transport: str = "stdio",
+        worktree_setup: str | None = None,
     ):
         self.rpc = rpc
         self.ledger = ledger
@@ -140,6 +141,15 @@ class Bridge:
         ):
             raise ValueError("remote_root must be a clean absolute POSIX path other than /")
         self.remote_root = remote_root
+        # Remote mode: an executable on the App Server host run as [worktree_setup, <worktree>]
+        # after each new worktree is checked out and before its task starts.
+        if worktree_setup is not None and (
+            remote_root is None
+            or not worktree_setup.startswith("/")
+            or posixpath.normpath(worktree_setup) != worktree_setup
+        ):
+            raise ValueError("worktree_setup requires remote mode and a clean absolute POSIX path")
+        self.worktree_setup = worktree_setup
 
     @property
     def remote(self) -> bool:
@@ -709,6 +719,17 @@ class Bridge:
             if head["exitCode"] != 0:
                 raise WorktreeError(f"new worktree is not usable: {head['stderr']}")
             receipt["worktree"]["head"] = head["stdout"].strip()
+            if self.worktree_setup is not None:
+                checkpoint("setting_up_worktree")
+                setup = await self._git_exec(
+                    [self.worktree_setup, path], rw.write_sandbox(self.remote_root), timeout_s=120
+                )
+                receipt["worktree"]["setup"] = setup
+                if setup["exitCode"] != 0:
+                    raise WorktreeError(
+                        f"worktree setup failed (exit {setup['exitCode']}); task not started: "
+                        f"{setup['stderr'] or setup['stdout']}"
+                    )
             checkpoint("creating_thread")
             launch = {
                 "cwd": path,

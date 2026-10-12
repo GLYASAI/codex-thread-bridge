@@ -39,6 +39,11 @@ class FakeServer:
     def exec(self, params):
         """Tiny `git worktree` simulator for command/exec. exec_fail["worktree add"] = (code, err)."""
         argv = params["command"]
+        if argv[0] != "git":  # --worktree-setup executable: [path, <worktree>]
+            fail = self.exec_fail.get("setup")
+            if fail:
+                return {"exitCode": fail[0], "stdout": "", "stderr": fail[1]}
+            return {"exitCode": 0, "stdout": "synchronized\n", "stderr": ""}
         assert argv[:2] == ["git", "-C"], argv
         repo, verb = argv[2], argv[3:5]
         fail = self.exec_fail.get(" ".join(verb))
